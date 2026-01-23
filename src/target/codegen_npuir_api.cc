@@ -2410,6 +2410,9 @@ void CodeGenTileLangNPUIRAPI::AddFunction(const GlobalVar& gvar, const PrimFunc&
   this->module->getOperation()->setAttr(mlir::hivm::TModuleCoreTypeAttr::name,
                                         moduleCoreType);
 
+  this->module->getOperation()->setAttr("memref.memref_as_ptr",
+                                        UnitAttr::get(builder.getContext()));
+
   if (this->func_coretype == NPU_CORETYPE::MIX ||
       this->func_coretype == NPU_CORETYPE::AIC) {
     this->current_coretype = NPU_CORETYPE::AIC;

@@ -2657,6 +2657,9 @@ void CodeGenTileLangNPUIRDEV::AddFunction(const GlobalVar& gvar, const PrimFunc&
         mlir::hivm::TModuleCoreTypeAttr::get(&this->context, NPUIR_MODULECORETYPE_STR[this->func_coretype]);
     this->module->getOperation()->setAttr(mlir::hivm::TModuleCoreTypeAttr::name, moduleCoreType);
 
+    this->module->getOperation()->setAttr("memref.memref_as_ptr",
+                                        UnitAttr::get(builder.getContext()));
+
     switch (this->func_coretype) {
         case NPU_CORETYPE::AIC:
             this->current_coretype = NPU_CORETYPE::AIC;

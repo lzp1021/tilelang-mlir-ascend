@@ -517,7 +517,7 @@ extern "C" {
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 {'#include <torch_npu/csrc/framework/OpCommand.h>' if enable_taskqueue else ''}
-#include "experiment/runtime/runtime/rt.h"
+#include "runtime/runtime/rt.h"
 {extract_device_print_code_from_cann()}
 
 #define TENSOR_KIND_INPUT 0
@@ -722,7 +722,7 @@ def generate_npu_utils_src():
 #include <tuple>
 #include <unordered_map>
 
-#include "experiment/runtime/runtime/rt.h"
+#include "runtime/runtime/rt.h"
 
 // Use map to differentiate same name functions from different binary
 static std::unordered_map<std::string, size_t> registered_names;
@@ -1370,6 +1370,13 @@ class compiler_npu:
         cc_cmd += [f"-I{os.path.dirname(os.path.realpath(__file__))}"]
         # find the ascend library
         asc_path = self._get_ascend_path()
+
+        rt_path = os.path.join(asc_path, "include/experiment/runtime/runtime/rt.h")
+        if not os.path.exists(rt_path):
+            cc_cmd += [
+                f"-I{os.path.join(asc_path, 'pkg_inc')}",
+                f"-I{os.path.join(asc_path, 'pkg_inc/profiling')}",
+            ]
 
         cc_cmd += [
             f"-I{os.path.join(asc_path, 'include')}",
