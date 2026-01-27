@@ -177,6 +177,28 @@ getBroadcastDim(const Array<PrimExpr> &buffer_shape0,
   return dims;
 }
 
+static llvm::SmallVector<int64_t>
+getBroadcastDim(const Array<PrimExpr> &buffer_shape0,
+                const std::vector<int64_t> &buffer_shape1) {
+  llvm::SmallVector<int64_t> dims;
+  if (buffer_shape0.empty() || buffer_shape1.empty()) {
+    return dims;
+  }
+  CHECK(buffer_shape0.size() == buffer_shape1.size());
+  for (int i = 0; i < buffer_shape0.size(); i++) {
+    if (*as_const_int(buffer_shape0[i]) == 1 &&
+        buffer_shape1[i] != 1) {
+      dims.emplace_back(i);
+    } else if (*as_const_int(buffer_shape0[i]) != 1 &&
+               buffer_shape1[i] == 1) {
+      dims.emplace_back(i);
+    } else {
+      CHECK(*as_const_int(buffer_shape0[i]) == buffer_shape1[i]);
+    }
+  }
+  return dims;
+}
+
 static std::map<std::string, mlir::hivm::RoundMode> NPUIR_STR_ROUNDMODE{
     {"round", mlir::hivm::RoundMode::ROUND},
     {"rint", mlir::hivm::RoundMode::RINT},
@@ -1558,29 +1580,160 @@ void CodeGenTileLangNPUIRDEV::BarrierCodegen(const CallNode *op) {
                                              pipAttrType);
 }
 
+mlir::Value CodeGenTileLangNPUIRDEV::NeedGenInsertSlice(
+    Buffer buffer_data,
+    Array<Range> range,
+    mlir::Value src) { 
+
+  Array<PrimExpr> region_shape, region_indices;
+  for (Range r : range) {
+    region_shape.push_back(r.get()->extent);
+    region_indices.push_back(r.get()->min);
+  }
+
+  if (IsEqual(buffer_data->shape, region_shape) && AllZero(region_indices)) {
+    return GetVarValue(buffer_data);
+  }
+
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> shape_val;
+  SmallVector<OpFoldResult> strides_val;
+  for (Range r : range) {
+    // if size or offset is var, create IndexCastOp and push the mlir value into
+    // the parameter of SubViewOp.
+    if (auto s_int = as_const_int(r.get()->min)) {
+      offsets.push_back(builder.getI64IntegerAttr(*s_int));
+    } else {
+      mlir::Value indexVal = CreateIndexCastOp(MakeValue(r.get()->min));
+      offsets.push_back(indexVal);
+    }
+    if (auto s_int = as_const_int(r.get()->extent)) {
+      shape_val.push_back(builder.getI64IntegerAttr(*s_int));
+    } else {
+      mlir::Value s_index = CreateIndexCastOp(MakeValue(r.get()->extent));
+      shape_val.push_back(s_index);
+    }
+    strides_val.push_back(builder.getI64IntegerAttr(1));
+  }
+
+  auto srcTensorTy = src.getType().cast<mlir::TensorType>();
+  auto dstTensorTy = GetVarValue(buffer_data).getType().cast<mlir::TensorType>();
+  auto elemTy = dstTensorTy.getElementType();
+  auto srcShape = srcTensorTy.getShape();
+  
+  auto emptyTensor = builder.create<mlir::tensor::EmptyOp>(
+      builder.getUnknownLoc(),
+      srcShape,
+      elemTy);
+
+  return emptyTensor.getResult();
+}
+
+// Convert TVM Range to MLIR OpFoldResult arrays
+std::tuple<SmallVector<mlir::OpFoldResult>, 
+           SmallVector<mlir::OpFoldResult>, 
+           SmallVector<mlir::OpFoldResult>> 
+CodeGenTileLangNPUIRDEV::CreateOpFoldResultArray(const Array<Range>& range) {
+  // TODO: support dynamic shape
+  SmallVector<mlir::OpFoldResult> offsets;
+  SmallVector<mlir::OpFoldResult> sizes;
+  SmallVector<mlir::OpFoldResult> strides;
+  for (const auto& r : range) {
+    // offset
+    if (auto offset_int = as_const_int(r->min)) {
+      offsets.push_back(builder.getI64IntegerAttr(*offset_int));
+    } else {
+      mlir::Value offsetVal = CreateIndexCastOp(MakeValue(r->min));
+      offsets.push_back(offsetVal);
+    }
+    // size
+    if (auto size_int = as_const_int(r->extent)) {
+      sizes.push_back(builder.getI64IntegerAttr(*size_int));
+    } else {
+      mlir::Value sizeVal = CreateIndexCastOp(MakeValue(r->extent));
+      sizes.push_back(sizeVal);
+    }
+    // stride (usually 1)
+    strides.push_back(builder.getI64IntegerAttr(1));
+  }
+  return {offsets, sizes, strides};
+}
+
+mlir::Value CodeGenTileLangNPUIRDEV::ReshapeCastAndInsertSlice(
+    mlir::Value tensor, 
+    mlir::Value dst,   
+    Array<Range> dst_range) 
+{
+    auto [offsets, sizes, strides] = CreateOpFoldResultArray(dst_range);
+
+    mlir::Value reshaped = MaybeReshapeTensorByDstSize(tensor, sizes);
+
+    mlir::Value casted = CreateCastIfTypeMismatch(reshaped, dst);
+
+    mlir::Value result = InsertSlice(
+      casted, dst,
+      const_cast<llvm::SmallVector<mlir::OpFoldResult>&>(offsets),
+      const_cast<llvm::SmallVector<mlir::OpFoldResult>&>(sizes),
+      const_cast<llvm::SmallVector<mlir::OpFoldResult>&>(strides));
+
+    return result;
+}
+
+
 void CodeGenTileLangNPUIRDEV::VselectCodegen(const CallNode *op) {
   /// Generate hivm.hir.vsel for tl.npuir_select.
   /// before:
   ///   T.npuir_select(Cond_VEC, A_VEC, B_VEC, C_VEC)
   /// after:
-  ///   hivm.hir.vsel ins(%v__9, %A_VEC, %B_VEC : memref<32x64xi1, strided<[64,
-  ///   1], offset:0>, #hivm.address_space<ub>>, memref<32x64xf16, strided<[64,
-  ///   1], offset:0>, #hivm.address_space<ub>>, memref<32x64xf16, strided<[64,
-  ///   1], offset:0>, #hivm.address_space<ub>>) outs(%C_VEC : memref<32x64xf16,
-  ///   strided<[64, 1], offset:0>, #hivm.address_space<ub>>)
+  ///  Partial Insertion:
+  ///  %8 = tensor.empty() : tensor<32xf16>
+  ///  %9 = hivm.hir.vsel ins(%Cond_VEC, %A_VEC, %B_VEC : tensor<32xi1>, tensor<32xf16>, tensor<32xf16>) outs(%8 : tensor<32xf16>) -> tensor<32xf16>
+  ///  %c1 = arith.constant 1 : index
+  ///  %c32 = arith.constant 32 : index
+  ///  %from_elements = tensor.from_elements %c1, %c32 : tensor<2xindex>
+  ///  %reshape = tensor.reshape %9(%from_elements) : (tensor<32xf16>, tensor<2xindex>) -> tensor<1x32xf16>
+  ///  %inserted_slice = tensor.insert_slice %reshape into %C_VEC[%7, 0] [1, 32] [1, 1] : tensor<1x32xf16> into tensor<8x32xf16>
+  ///  
+  ///  Original/full shape:
+  ///  %result = hivm.hir.vsel ins(%Cond_VEC, %A_VEC, %B_VEC : tensor<32xi1>, tensor<32xf16>, tensor<32xf16>) outs(%9 : tensor<32xf16>) -> tensor<32xf16>
+
   tvm::tl::NpuirSelect npuirop(op->args, this->vmap);
-  // gen memref.subview
-  auto cond_data_name = GenSubviewFromRegion(npuirop.cond, npuirop.cond_range);
-  auto src0_data_name = GenSubviewFromRegion(npuirop.src0, npuirop.src0_range);
-  auto src1_data_name = GenSubviewFromRegion(npuirop.src1, npuirop.src1_range);
-  auto dst_data_name = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  // gen mlir::hivm::VSelOp
-  auto broadcastDim = getBroadcastDim(npuirop.src0->shape, npuirop.dst->shape);
+
+  mlir::Value cond_data_name = GetVarValue(npuirop.cond);
+  mlir::Value src0_data_name = GetVarValue(npuirop.src0);
+  mlir::Value src1_data_name = GetVarValue(npuirop.src1);
+  mlir::Value dst_data_name = GetVarValue(npuirop.dst);
+
+  if (!dst_data_name.getType().isa<mlir::TensorType>()) {
+    return;
+  }
+
+  auto srcTensorTy = src0_data_name.getType().cast<mlir::TensorType>();
+  auto srcShape = srcTensorTy.getShape();
+
+  mlir::Value insertBase = NeedGenInsertSlice(npuirop.dst, npuirop.dst_range, src0_data_name);
+  bool needInsertSlice = (insertBase != GetVarValue(npuirop.dst));
+
+  std::vector<int64_t> srcShapeVec(srcShape.begin(), srcShape.end());
+  auto broadcastDim = getBroadcastDim(npuirop.src0->shape, srcShapeVec);
+
+  mlir::Value selOutput;
+
   auto selOp = builder.create<mlir::hivm::VSelOp>(
-      builder.getUnknownLoc(), mlir::TypeRange{},
+      builder.getUnknownLoc(),
+      mlir::TypeRange{insertBase.getType()},
       mlir::ValueRange{cond_data_name, src0_data_name, src1_data_name},
-      mlir::ValueRange{dst_data_name}, mlir::Value());
+      mlir::ValueRange{insertBase},
+      mlir::Value());
+  
   selOp->setAttr("broadcast", builder.getDenseI64ArrayAttr(broadcastDim));
+  selOutput = selOp.getResult()[0];
+  
+  mlir::Value result = needInsertSlice
+    ? ReshapeCastAndInsertSlice(selOutput, dst_data_name, npuirop.dst_range)
+    : selOutput;
+
+  SetVarValue(npuirop.dst, result);
 }
 
 /// Generate hivm.hir.vbrc for tl.npuir_brc.
@@ -2007,6 +2160,17 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
   const CallNode *region_node_dst = op->args[2].as<CallNode>();
   // Result will always be a vector. No need to add scalar check.
   mlir::Value dst = GetVarValue(region_node_dst);
+
+  tvm::tl::RegionOp region_dst_tmp(region_node_dst->args, vmap);
+  Array<Range> dst_range = region_dst_tmp.GetRanges();
+
+
+  auto srcTensorTy = src0.getType().cast<mlir::TensorType>();
+  auto srcShape = srcTensorTy.getShape();
+
+  mlir::Value insertBase = NeedGenInsertSlice(region_dst_tmp.GetBuffer(), dst_range, src0);
+  bool needInsertSlice = (insertBase != GetVarValue(region_node_dst));
+
   // transpose
   mlir::DenseI64ArrayAttr transpose = builder.getDenseI64ArrayAttr({});
   // broadcast
@@ -2018,33 +2182,39 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
   mlir::TypeRange result_tensors(&dst_type, 1);
   // Create hivm::op
   auto loc = builder.getUnknownLoc();
+  mlir::Value newOpValue;
+
+  llvm::SmallVector<int64_t> elemShape(srcShape.begin(), srcShape.end());
+
   if constexpr (std::is_same_v<T, mlir::hivm::VCmpOp>) {
     mlir::hivm::CompareMode mode =
-        COMPARE_MODE[op->args[3].as<StringImm>().value()->value];
+          COMPARE_MODE[op->args[3].as<StringImm>().value()->value];
     auto cmp_attr =
         mlir::hivm::CompareModeAttr::get(builder.getContext(), mode);
-    auto newOp = builder.create<T>(loc, result_tensors, mlir::ValueRange{src0, src1},
-        mlir::ValueRange{dst}, cmp_attr, transpose, broadcast);
-    mlir::Value newOpValue = newOp->getResult(0);
-    SetVarValue(region_node_dst, newOpValue);
+    auto newOp = builder.create<T>(loc, insertBase.getType(), mlir::ValueRange{src0, src1},
+        mlir::ValueRange{insertBase}, cmp_attr, transpose, broadcast);
+    newOpValue = newOp->getResult(0);
   } else if constexpr (std::is_same_v<T, mlir::hivm::VPowOp>) {
-    auto newOp = builder.create<T>(loc, result_tensors, mlir::ValueRange{src0, src1},
-        mlir::ValueRange{dst}, mlir::Value(), transpose, broadcast);
-    mlir::Value newOpValue = newOp->getResult(0);
-    SetVarValue(region_node_dst, newOpValue);
+    auto newOp = builder.create<T>(loc, insertBase.getType(), mlir::ValueRange{src0, src1},
+        mlir::ValueRange{insertBase}, mlir::Value(), transpose, broadcast);
+    newOpValue = newOp->getResult(0);
   } else if constexpr (std::is_same_v<T, mlir::hivm::VShROp>) {
     auto round_attr = mlir::BoolAttr::get(
         builder.getContext(), op->args[3].as<Bool>().value());
-    auto newOp = builder.create<T>(loc, result_tensors, mlir::ValueRange{src0, src1},
-        mlir::ValueRange{dst}, round_attr, transpose, broadcast);
-    mlir::Value newOpValue = newOp->getResult(0);
-    SetVarValue(region_node_dst, newOpValue);
+    auto newOp = builder.create<T>(loc, insertBase.getType(), mlir::ValueRange{src0, src1},
+        mlir::ValueRange{insertBase}, round_attr, transpose, broadcast);
+    newOpValue = newOp->getResult(0);
   } else {
-    auto newOp = builder.create<T>(loc, result_tensors, mlir::ValueRange{src0, src1},
-        mlir::ValueRange{dst}, transpose, broadcast);
-    mlir::Value newOpValue = newOp->getResult(0);
-    SetVarValue(region_node_dst, newOpValue);
+    auto newOp = builder.create<T>(loc, insertBase.getType(), mlir::ValueRange{src0, src1},
+        mlir::ValueRange{insertBase}, transpose, broadcast);
+    newOpValue = newOp->getResult(0);
   }
+
+  mlir::Value result = needInsertSlice
+    ? ReshapeCastAndInsertSlice(newOpValue, dst, dst_range)
+    : newOpValue;
+
+  SetVarValue(region_node_dst, result);
 }
 
 void CodeGenTileLangNPUIRDEV::BitcastCodegen(const CallNode *op) {
