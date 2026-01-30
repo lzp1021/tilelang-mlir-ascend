@@ -1675,7 +1675,6 @@ mlir::Value CodeGenTileLangNPUIRDEV::ReshapeCastAndInsertSlice(
       const_cast<llvm::SmallVector<mlir::OpFoldResult>&>(offsets),
       const_cast<llvm::SmallVector<mlir::OpFoldResult>&>(sizes),
       const_cast<llvm::SmallVector<mlir::OpFoldResult>&>(strides));
-
     return result;
 }
 
@@ -2134,25 +2133,35 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
       // Vector case
       const CallNode *region_node = op->args[arg_id].as<CallNode>();
       auto buffer_node = region_node->args[0].as<BufferLoadNode>();
-      size_t ndim = buffer_node->buffer->shape.size();
-      Array<PrimExpr> region_extent;
-      for (size_t i = 0; i < ndim; i++) {
-        region_extent.push_back(region_node->args[2 + i]);
-      }
+      Array<PrimExpr> tmp_buffer_shape = buffer_node->buffer->shape;
       bool is_scalar_load = true;
-      for (size_t i = 0; i < ndim; i++) {
+      for (int i = 0; i < tmp_buffer_shape.size(); i++) {
         const IntImmNode* int_imm = region_node->args[2 + i].as<IntImmNode>();
         if (!int_imm || int_imm->value != 1) {
           is_scalar_load = false;
           break;
         }
       }
+      const IntImmNode* int_imm = region_node->args[2].as<IntImmNode>();
       // If load only one element, do not use memref.subview, use memref.load as a scalar
-      if (is_scalar_load) {
+      if(is_scalar_load) {
         src = VisitExpr_(buffer_node);
       } else {
         src = GenExtractSliceFromRegion(region_node);
-        buffer_shape = region_extent;
+
+        auto tensorType = src.getType().dyn_cast<mlir::TensorType>();
+        
+        buffer_shape.clear();
+
+        for (int64_t dim : tensorType.getShape()) {
+          if (dim >= 0) {
+            buffer_shape.push_back(
+                tir::make_const(DataType::Int(64), dim));
+          } else {
+            ICHECK(false)
+                << "dynamic tensor shape not supported yet";
+          }
+        }
       }
     }
   };
@@ -2163,8 +2172,6 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
   processImm(src1, 1, buffer_shape1);
   // dst
   const CallNode *region_node_dst = op->args[2].as<CallNode>();
-  // Result will always be a vector. No need to add scalar check.
-  mlir::Value dst = GetVarValue(region_node_dst);
 
   tvm::tl::RegionOp region_dst_tmp(region_node_dst->args, vmap);
   Array<Range> dst_range = region_dst_tmp.GetRanges();
@@ -2182,9 +2189,7 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
   llvm::SmallVector<int64_t> dims =
       getBroadcastDim(buffer_shape0, buffer_shape1);
   mlir::DenseI64ArrayAttr broadcast = builder.getDenseI64ArrayAttr(dims);
-  // typerange
-  mlir::Type dst_type = dst.getType();
-  mlir::TypeRange result_tensors(&dst_type, 1);
+
   // Create hivm::op
   auto loc = builder.getUnknownLoc();
   mlir::Value newOpValue;
@@ -2216,7 +2221,7 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
   }
 
   mlir::Value result = needInsertSlice
-    ? ReshapeCastAndInsertSlice(newOpValue, dst, dst_range)
+    ? ReshapeCastAndInsertSlice(newOpValue, GetVarValue(region_node_dst), dst_range)
     : newOpValue;
 
   SetVarValue(region_node_dst, result);
