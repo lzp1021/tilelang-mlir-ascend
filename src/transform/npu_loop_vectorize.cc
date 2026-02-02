@@ -600,22 +600,27 @@ private:
     return true;
   }
 
-  // check whether a single call statement can be vectorized
-  bool CallExternEnableVectorize(const Stmt& stmt) {
-    if (const auto* evaluate = stmt.as<EvaluateNode>()) {
-      const tvm::PrimExpr& value = evaluate->value;
+  Stmt SplitStmtToIndependentForNode(const ForNode* forNode, const Stmt& stmt){
+    Var new_loop_var = Var(
+      forNode->loop_var->name_hint + "_split",
+      forNode->loop_var->dtype
+    );
 
-      if (const auto* call = value.as<tvm::tir::CallNode>()) {
-        if (const auto* op_node = call->op.as<tvm::OpNode>()) {
-          tvm::Op op = tvm::GetRef<tvm::Op>(op_node);
-          return static_cast<bool>(CandidateVectorizationOps.count(op->name));
-        }
-      }
-    }
-    return false;
+    Map<Var, PrimExpr> var_map;
+    var_map.Set(forNode->loop_var, new_loop_var);
+    Stmt new_body = Substitute(stmt, var_map);
+
+    return For(new_loop_var,
+               forNode->min,
+               forNode->extent,
+               forNode->kind,
+               new_body,
+               forNode->thread_binding,
+               forNode->annotations,
+               forNode->span);
   }
 
-  // vectorize a region which belong to a call statement
+  // Vectorize a region which belongs to a call statement
   PrimExpr VectorizeRegionInLoop(const PrimExpr& expr, const VarNode* loop_var, size_t start, size_t loop_count) {
     const auto* call = expr.as<CallNode>();
     const auto* buffer_load = call->args[0].as<BufferLoadNode>();
@@ -643,34 +648,46 @@ private:
     return BuildRegionCall(buffer, offsets_vec, regionId, size_vec);
   }
 
-  // vectorize a single call statement
-  Stmt VectorizeCallExtern(const ForNode* for_node, const Stmt& stmt) {
-    const auto* evaluate = stmt.as<tvm::tir::EvaluateNode>();
-    if (!evaluate) return StmtMutator::VisitStmt_(for_node);
+  Stmt VectorizeForBody(const ForNode* forNode, const Stmt& stmt) {
+    if (const auto* alloc=stmt.as<AllocateNode>()){
+      return stmt;
+    }
 
+    // Only support evaluate node for vectorization
+    const auto* evaluate = stmt.as<EvaluateNode>();
+    if (!evaluate) return SplitStmtToIndependentForNode(forNode, stmt);
+
+    // Only support call node inside evaluate node
     const auto* call = evaluate->value.as<tvm::tir::CallNode>();
-    if (!call) return StmtMutator::VisitStmt_(for_node);
+    if (!call) return SplitStmtToIndependentForNode(forNode, stmt);
 
+    // Only Ops in 'CandidateVectorizationOps' are supported
+    bool flag_op_supported = false;
+    if (const auto* op_node = call->op.as<tvm::OpNode>()) {
+      tvm::Op op = tvm::GetRef<tvm::Op>(op_node);
+      flag_op_supported = static_cast<bool>(CandidateVectorizationOps.count(op->name));
+    }
+    if (!flag_op_supported) return SplitStmtToIndependentForNode(forNode, stmt);
+
+    // Enable vectorization only when regions satisfy specific conditions
     bool flag_region_vectorizable = true;
-    auto loop_var_node_ptr = for_node->loop_var.get();
-
+    auto loop_var_node_ptr = forNode->loop_var.get();
     for (const auto& region : call->args) {
       if (IsScalar(region)) continue;
       if (!RegionInLoopEnableVectorize(region, loop_var_node_ptr)) {
         flag_region_vectorizable = false;
       }
     }
+    if (!flag_region_vectorizable) return SplitStmtToIndependentForNode(forNode, stmt);
 
-    if (!flag_region_vectorizable) {
-      return StmtMutator::VisitStmt_(for_node);
-    }
-
-    auto loop_min_value = TryGetConstIntValue(for_node->min);
-    auto loop_extent_value = TryGetConstIntValue(for_node->extent);
+    // min_value & loop_extent_value must exist
+    auto loop_min_value = TryGetConstIntValue(forNode->min);
+    auto loop_extent_value = TryGetConstIntValue(forNode->extent);
     if (!loop_min_value || !loop_extent_value) {
-      return StmtMutator::VisitStmt_(for_node);
+      return SplitStmtToIndependentForNode(forNode, stmt);
     }
 
+    // All conditions satisfied, start vectorization
     std::vector<PrimExpr> new_regions;
     for (const auto& region : call->args) {
       if (IsScalar(region)) {
@@ -682,32 +699,7 @@ private:
 
     Array<PrimExpr> args(new_regions);
     PrimExpr new_call = Call(DataType::Void(), call->op, args);
-    auto result = Evaluate(new_call);
-    return SeqStmt::Flatten(result);
-  }
-
-  Stmt VectorizeForBody(const ForNode* forNode, const Stmt& stmt) {
-    if (CallExternEnableVectorize(stmt)) {
-      return VectorizeCallExtern(forNode, stmt);
-    }
-
-    Var new_loop_var = Var(
-      forNode->loop_var->name_hint + "_split",
-      forNode->loop_var->dtype
-    );
-
-    Map<Var, PrimExpr> var_map;
-    var_map.Set(forNode->loop_var, new_loop_var);
-    Stmt new_body = Substitute(stmt, var_map);
-
-    return For(new_loop_var,
-               forNode->min,
-               forNode->extent,
-               forNode->kind,
-               new_body,
-               forNode->thread_binding,
-               forNode->annotations,
-               forNode->span);
+    return Evaluate(new_call);
   }
 
   Stmt VectorizeForBody(const ForNode* forNode, const SeqStmt& seqStmt) {
