@@ -353,9 +353,10 @@ private:
       mlir::Value base,
       llvm::ArrayRef<mlir::OpFoldResult> sizesSameRank,
       mlir::Location loc);
-  llvm::SmallVector<int64_t> ComputeUBAllocShapeDropStaticOnes(
-      mlir::RankedTensorType dst_tensor_type_ori);
-  
+  llvm::SmallVector<int64_t> ComputeUBAllocShapeFromDstRange(
+      mlir::RankedTensorType dst_tensor_type_ori,
+      llvm::ArrayRef<mlir::OpFoldResult> dstR_sizes);
+
   NPU_CORETYPE func_coretype;
 
   // For mix kernel, generate target functions twice. One is for aic while

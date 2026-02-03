@@ -1378,6 +1378,32 @@ CodeGenTileLangNPUIRDEV::CollapseStaticOneDims(
   return out;
 }
 
+// Returns true iff all OpFoldResults are static and equal to 0
+static bool OpFoldResultsAllZero(llvm::ArrayRef<mlir::OpFoldResult> ofrs) {
+  for (const auto& ofr : ofrs) {
+    auto attr = ofr.dyn_cast<mlir::Attribute>();
+    if (!attr) return false;
+    auto intAttr = attr.dyn_cast<mlir::IntegerAttr>();
+    if (!intAttr || intAttr.getInt() != 0) return false;
+  }
+  return true;
+}
+
+// Returns true iff sizes are all static and equal to staticShape
+static bool OpFoldResultsEqualStaticShape(
+    llvm::ArrayRef<mlir::OpFoldResult> sizes,
+    llvm::ArrayRef<int64_t> staticShape) {
+  if (sizes.size() != staticShape.size()) return false;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    auto attr = sizes[i].dyn_cast<mlir::Attribute>();
+    if (!attr) return false;
+    auto intAttr = attr.dyn_cast<mlir::IntegerAttr>();
+    if (!intAttr) return false;
+    if (intAttr.getInt() != staticShape[i]) return false;
+  }
+  return true;
+}
+
 // Creates a rank-reduced memref.subview from a base memref using full-rank offset/size/stride arrays.
 // The resulting memref rank is determined by projectedReducedShape via inferRankReducedResultType.
 mlir::Value CodeGenTileLangNPUIRDEV::CreateRankReducedSubviewFromBaseRank(
@@ -1391,6 +1417,12 @@ mlir::Value CodeGenTileLangNPUIRDEV::CreateRankReducedSubviewFromBaseRank(
   ICHECK((int64_t)fullOffsets.size() == baseTy.getRank());
   ICHECK((int64_t)fullSizes.size() == baseTy.getRank());
   ICHECK((int64_t)fullStrides.size() == baseTy.getRank());
+
+  if (baseTy.getRank() == (int64_t)projectedReducedShape.size() &&
+      OpFoldResultsAllZero(fullOffsets) &&
+      OpFoldResultsEqualStaticShape(fullSizes, baseTy.getShape())) {
+    return base;
+  }
 
   auto reducedTy =
       mlir::memref::SubViewOp::inferRankReducedResultType(
@@ -1415,6 +1447,12 @@ mlir::Value CodeGenTileLangNPUIRDEV::CreateRankReducedExtractSlice(
   ICHECK((int64_t)fullSizes.size() == baseTy.getRank());
   ICHECK((int64_t)fullStrides.size() == baseTy.getRank());
 
+  if (baseTy.getRank() == (int64_t)projectedReducedShape.size() &&
+      OpFoldResultsAllZero(fullOffsets) &&
+      OpFoldResultsEqualStaticShape(fullSizes, baseTy.getShape())) {
+    return base;
+  }
+
   auto reducedTy = mlir::RankedTensorType::get(
       projectedReducedShape, baseTy.getElementType());
 
@@ -1437,12 +1475,25 @@ mlir::Value CodeGenTileLangNPUIRDEV::CreateSameRankDynamicSubview(
 }
 
 llvm::SmallVector<int64_t>
-CodeGenTileLangNPUIRDEV::ComputeUBAllocShapeDropStaticOnes(
-    mlir::RankedTensorType dst_tensor_type_ori) {
-  llvm::SmallVector<int64_t> ub_alloc_shape;
-  ub_alloc_shape.reserve(dst_tensor_type_ori.getRank());
+CodeGenTileLangNPUIRDEV::ComputeUBAllocShapeFromDstRange(
+    mlir::RankedTensorType dst_tensor_type_ori,
+    llvm::ArrayRef<mlir::OpFoldResult> dstR_sizes) {
+  int64_t rank = dst_tensor_type_ori.getRank();
+  ICHECK((int64_t)dstR_sizes.size() == rank);
 
-  for (int64_t d : dst_tensor_type_ori.getShape()) {
+  llvm::SmallVector<int64_t> full_shape;
+  full_shape.reserve(rank);
+  for (int64_t i = 0; i < rank; ++i) {
+    if (auto attr = dstR_sizes[i].dyn_cast<mlir::Attribute>()) {
+      full_shape.push_back(attr.cast<mlir::IntegerAttr>().getInt());
+    } else {
+      full_shape.push_back(dst_tensor_type_ori.getDimSize(i));
+    }
+  }
+
+  llvm::SmallVector<int64_t> ub_alloc_shape;
+  ub_alloc_shape.reserve(rank);
+  for (int64_t d : full_shape) {
     if (d == 1) continue;  // drop static 1 as in original
     ub_alloc_shape.push_back(d);
   }
@@ -1467,9 +1518,18 @@ void CodeGenTileLangNPUIRDEV::EmitCopyMemrefToTensor(
   mlir::Value src_view = CreateRankReducedSubviewFromBaseRank(
     src, srcR.offs, srcR.sizes, srcR.strides, copy_projected, loc);
 
-  // 3) Alloc UB: drop ALL static-1 dims from dst tensor type
+  // 3) Alloc UB from dst_range. kDynamic appears only when dst type has a dynamic dim;
+  //    dst_range dynamic + dst static => static alloc (dst dim as bound), dynamic subview.
   llvm::SmallVector<int64_t> ub_alloc_shape =
-      ComputeUBAllocShapeDropStaticOnes(dst_tensor_type_ori);
+      ComputeUBAllocShapeFromDstRange(dst_tensor_type_ori, dstR.sizes);
+  bool has_dynamic = false;
+  for (int64_t d : ub_alloc_shape) {
+    if (mlir::ShapedType::isDynamic(d)) {
+      has_dynamic = true;
+      break;
+    }
+  }
+  ICHECK(!has_dynamic) << "dst with dynamic dimension(s) not supported for UB alloc";
 
   mlir::Value base_ub = CreateStaticLocalUB(
       ub_alloc_shape, dst_tensor_type_ori.getElementType(), loc);
@@ -1479,7 +1539,12 @@ void CodeGenTileLangNPUIRDEV::EmitCopyMemrefToTensor(
   auto ubTy = base_ub.getType().cast<mlir::MemRefType>();
 
   if ((int64_t)copy_sizes.size() == ubTy.getRank()) {
-    ub_view = CreateSameRankDynamicSubview(base_ub, copy_sizes, loc);
+    // When shape is static and matches alloc shape (offsets are 0), skip subview
+    if (OpFoldResultsEqualStaticShape(copy_sizes, ub_alloc_shape)) {
+      ub_view = base_ub;
+    } else {
+      ub_view = CreateSameRankDynamicSubview(base_ub, copy_sizes, loc);
+    }
   } else {
     CollapsedDims dstC = CollapseStaticOneDims(dstR.sizes);
 
@@ -1559,8 +1624,15 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToTensor(
     mlir::Value src, mlir::Value dst,
     const SliceRange& srcR, const SliceRange& dstR,
     mlir::Location loc) {
-  mlir::Value src_slice = builder.create<mlir::tensor::ExtractSliceOp>(
-      loc, src, srcR.offs, srcR.sizes, srcR.strides);
+  mlir::Value src_slice;
+  auto srcTy = src.getType().cast<mlir::RankedTensorType>();
+  if (OpFoldResultsAllZero(srcR.offs) &&
+      OpFoldResultsEqualStaticShape(srcR.sizes, srcTy.getShape())) {
+    src_slice = src;
+  } else {
+    src_slice = builder.create<mlir::tensor::ExtractSliceOp>(
+        loc, src, srcR.offs, srcR.sizes, srcR.strides).getResult();
+  }
 
   // Use tensor.reshape instead of expand_shape/collapse_shape to avoid
   // bufferization failures on tensors derived from strided memrefs.
@@ -1595,8 +1667,11 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToTensor(
  *    - Rank/Shape Handling:
  *        a) Canonicalize the copy rank by dropping static-1 dims from the source range.
  *        b) Create a rank-reduced `memref.subview` of the source GM matching the canonical rank.
- *        c) Allocate a static local UB memref using the destination tensor shape with static-1s removed.
- *        d) Create an UB `memref.subview` matching the canonical copy rank.
+ *        c) Allocate a static local UB memref using the dst_range shape with static-1s removed;
+ *           when a dst_range dim is dynamic, use the corresponding dst tensor dim as static upper
+ *           bound (fallback to full dst shape only when dst has a dynamic dim).
+ *        d) Create an UB view matching the canonical copy rank; skip subview when alloc shape
+ *           already matches copy shape (same as GenSubviewFromRegion).
  *        e) `memref.copy` from the GM view to the UB view.
  *        f) Convert UB to tensor via `bufferization.to_tensor`.
  *        g) Cast element type if needed, then directly use `tensor.insert_slice` with dstR.sizes
@@ -1606,8 +1681,10 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToTensor(
  *    - Concept:
  *        Store a tensor slice back to GM.
  *    - Logic:
- *        a) Extract a slice from the source tensor (`tensor.extract_slice`).
- *        b) Create a destination GM subview (`memref.subview`).
+ *        a) Extract a slice from the source tensor (`tensor.extract_slice`); skip when src range
+ *           is full and zero-offset.
+ *        b) Create a destination GM subview (`memref.subview`); skip when dst range is full
+ *           and zero-offset.
  *        c) Resolve potential rank/shape mismatches via reshape, and type mismatches via cast.
  *        d) Write using `bufferization.materialize_in_destination` (writable).
  *
@@ -1615,7 +1692,8 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToTensor(
  *    - Concept:
  *        Tensor-to-tensor movement / layout manipulation through slice extraction and insertion.
  *    - Logic:
- *        a) Extract slices from source and destination tensors.
+ *        a) Extract slice from source (skip when src range is full and zero-offset); destination
+ *           is used via insert_slice.
  *        b) Reshape/cast the source slice to match the destination slice type.
  *        c) Insert into destination using `tensor.insert_slice` and update the var binding.
  *
@@ -1623,7 +1701,7 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToTensor(
  *   Input:  tl.ascend_copy(src_gm[...], dst_tensor[...])
  *   Output:
  *     %src_view = memref.subview %src_gm [...]  : (rank-reduced)
- *     %ub       = memref.alloc()               : (local UB)
+ *     %ub       = memref.alloc()               : (local UB; shape from dst_range; subview may be omitted)
  *     memref.copy %src_view, %ub
  *     %val      = bufferization.to_tensor %ub
  *     %result   = tensor.insert_slice %val into %dst_tensor [...]
