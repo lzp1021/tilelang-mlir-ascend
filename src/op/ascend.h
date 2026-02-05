@@ -420,8 +420,8 @@ public:
   static const Op &Get();
 
   Buffer dst;
-  std::vector<int64_t> strides;
-  int64_t offset;
+  std::vector<PrimExpr> strides;
+  PrimExpr offset;
 
   Array<Range> dst_range;
 };
