@@ -1067,7 +1067,11 @@ void CodeGenTileLangNPUIRAPI::VbrcCodegen(const CallNode *op) {
   tvm::tl::NpuirBrc npuirop(op->args, this->vmap);
   mlir::Value src;
   llvm::ArrayRef<int64_t> inBufferShape;
-  if (npuirop.in.as<IntImm>() || npuirop.in.as<FloatImm>()) {
+  bool isScalar =
+      !npuirop.in.as<tvm::tir::Buffer>() &&
+      !npuirop.in.as<tvm::tir::BufferRegion>() &&
+      !npuirop.in.as<tvm::tir::CallNode>();
+  if (isScalar) {
     // Scalar case
     if (npuirop.in->dtype != npuirop.dst->dtype) {
       src = ScalarConvertType(npuirop.in, npuirop.dst->dtype);
@@ -1084,7 +1088,7 @@ void CodeGenTileLangNPUIRAPI::VbrcCodegen(const CallNode *op) {
   if (!inBufferShape.empty()) {
     auto outMemref = llvm::dyn_cast<TypedValue<MemRefType>>(dst);
     auto outBufferShape = outMemref.getType().getShape();
-    auto broadcastDim = getBroadcastDim(npuirop.src->shape, npuirop.dst->shape);
+    auto broadcastDim = getBroadcastDim(inBufferShape, outBufferShape);
     broadcastDimAttr = builder.getDenseI64ArrayAttr(broadcastDim);
   }
   builder.create<mlir::hivm::VBrcOp>(builder.getUnknownLoc(), TypeRange{},
