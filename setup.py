@@ -81,6 +81,10 @@ def get_requirements(file_path: str = "requirements.txt") -> List[str]:
     """Get Python package dependencies from requirements.txt."""
     with open(get_path(file_path)) as f:
         requirements = f.read().strip().split("\n")
+    requirements = [
+        r.strip() for r in requirements
+        if r.strip() and not r.strip().startswith("#") and not r.strip().startswith("--")
+    ]
     return requirements
 
 
@@ -358,6 +362,7 @@ class TileLangBuilPydCommand(build_py):
         # copy the tl_templates
         TILELANG_SRC = [
             "src/tl_templates",
+            "src/runtime",
         ]
         for item in TILELANG_SRC:
             source_dir = os.path.join(ROOT_DIR, item)
@@ -828,6 +833,7 @@ setup(
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
     ],
+    install_requires=get_requirements(),
     python_requires=">=3.8",
     package_data=package_data,
     include_package_data=False,
