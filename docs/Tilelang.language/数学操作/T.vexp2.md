@@ -1,11 +1,13 @@
-# Tilelang.language.vmin
+# Tilelang.language.vexp2
 
 ## 1. OP概述
 
-简介：`tilelang.language.vmin`对向量元素取最小值操作，该算子对比两个输入源的对应元素，并将较小值写入输出目标。
+简介：`tilelang.language.vexp2`执行逐元素底数为2的指数计算 $2^{src}$
+
+由于底层不支持硬件级别的exp2操作，实际上使用的是 $B = exp(A*ln2)$，其中 tmpBuffer 用来存储 $A*ln2$ 这一中间结果
 
 ```
-T.vmin(src1, src2, dst)
+T.vexp2(input, output, tmpBuffer)
 ```
 
 ## 2. OP规格
@@ -14,9 +16,9 @@ T.vmin(src1, src2, dst)
 
 | 参数名 | 类型 | 说明 |
 | - | - | - |
-| `src1` | `tensor` | 输入tensor1 |
-| `src2`                              | `tensor or scalar` | 输入tensor2或标量 |
-| `dst`                               | `tensor` | 输出tensor |
+| `input` | `tensor` | 输入tensor |
+| `output`                            | `tensor` | 输出tensor |
+| `tmpBuffer`                         | `tensor` | 临时空间tensor |
 
 ### 2.2 支持规格
 
@@ -24,22 +26,11 @@ T.vmin(src1, src2, dst)
 
 |   | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | bf16 | bool/int1 |
 | - | - | - | - | - | - | - | - | - | - | - | - | - |
-| Ascend | × | × | × | √ | × | √ | × | √ | √ | √ | × | × |
+| Ascend | × | × | × | × | × | × | × | × | √ | √ | × | × |
 
 #### 2.2.2 Shape支持
 
-结论：在shape方面：
-
-1. 当src1和src2具有相同shape时，min直接执行elementwise运算；
-2. 当src1和src2 shape不一致，且二者有且仅有一个维度的shape不同，且在该维度上，其中一个的size为1时，执行带brc的min，即此时vmin操作会自动广播；
-   示例：
-   ✅ 合法：
-   src1: (M, N, K)  src2: (M, N, K) → dst: (M, N, K)
-   src1: (M, 1, K)  src2: (M, N, K) → dst: (M, N, K)
-   src1: (1, N, K)  src2: (M, N, K) → dst: (M, N, K)
-   ❌ 非法：
-   src1: (1, 1, K)  src2: (M, N, K) → dst: (M, N, K)（两个维度不同，违反“仅一个维度不同”）
-3. src2可以使用标量进行计算
+input, output, tmpBuffer 三者形状需要一致
 
 ### 2.3 特殊限制说明
 
@@ -50,12 +41,15 @@ T.vmin(src1, src2, dst)
 以下示例展示了两个形状为(M,N)的输入tensor进行min计算：
 
 ```python
-def vec_min(M, N, block_M, block_N):
+import torch
+import torch_npu
+import tilelang
+import tilelang.language as T
+def vec_exp2(M, N, block_M, block_N):
     m_num = M // block_M
     n_num = N // block_N
     dtype = "float16"
     BLOCK_SIZE = 20
-
     @T.prim_func
     def main(
             A: T.Tensor((M, N), dtype),
@@ -75,12 +69,11 @@ def vec_min(M, N, block_M, block_N):
                     by = block_id_n * block_N
                     T.copy(A[bx, by], A_VEC)
                     T.copy(B[bx, by], B_VEC)
-                    T.vmin(A_VEC, B_VEC, C_VEC)
+                    T.vexp2(A_VEC, B_VEC, C_VEC)
                     T.copy(C_VEC, C[bx, by])
-
     return main
 ```
 
 ## 3. Tilelang Op到Ascend NPU IR Op的转换
 
-tilelang::vminOp将被转换为`hivm::VMinOp`
+tilelang::vexp2Op将被下降为`hivm::VMulOp`和`hivm::VExpOp`
