@@ -6,7 +6,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Union
-import sys
 import torch
 from ..engine import lower
 from ..utils import (
@@ -1468,11 +1467,9 @@ class compiler_npu:
                 # print error info
                 print("err cmd:", " ".join(cmd_list))
                 print(f"err code: {e.returncode}")
-                print("err info:", e.stderr)
-                sys.exit(1)
+                raise RuntimeError(f"NPU IR opt failed: {e.stderr}") from e
             except Exception as e:
-                print(f"error: {str(e)}")
-                sys.exit(1)
+                raise RuntimeError(f"NPU IR opt failed: {e.stderr}") from e
             result = self._get_workspace_size(
                 so_path, "_infer_workspace_shape_function"
             )
