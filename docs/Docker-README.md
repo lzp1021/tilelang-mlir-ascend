@@ -72,7 +72,7 @@ docker run -it --rm -v $(pwd):/workspace tilelang-ascend
 - **用户**: `tilelang`
 - **工作目录**: `/home/tilelang`
 - **时区**: Asia/Shanghai
-- **Python**: 默认 Python 3.10，多版本支持
+- **Python**: 默认 Python 3.11（根据 base image 的 PY_VERSION 参数），同时支持 Python 3.9/3.10/3.11 多版本
 
 ### 加速优化
 
