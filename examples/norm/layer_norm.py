@@ -4,7 +4,6 @@ import torch
 import os
 import torch.nn.functional as F
 
-torch.npu.set_device(11)
 ALIGNMENT = 256
 
 
