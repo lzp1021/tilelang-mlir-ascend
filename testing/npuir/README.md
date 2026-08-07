@@ -140,6 +140,34 @@ pytest testing/npuir --op=copy --mode=Developer --npu-device=0
 
 `--op` and `--mode` accept comma-separated values.
 
+## Python Coverage
+
+Install the test dependencies and run the shared coverage command from the
+repository root:
+
+```bash
+python -m pip install -r requirements-test.txt
+python scripts/run_python_coverage.py
+```
+
+The runner accepts the same pytest and NPUIR selection arguments as the direct
+pytest command:
+
+```bash
+python scripts/run_python_coverage.py --op=copy --mode=Developer --npu-device=0 -v
+```
+
+The command writes these reports:
+
+- pytest HTML: `testing/npuir/output/report.html`
+- coverage HTML: `coverage/python-html/index.html`
+- Cobertura coverage XML: `coverage/python.xml`
+- JUnit XML: `coverage/junit.xml`
+
+Coverage measures host Python code under `tilelang/`. It does not measure C++
+or MLIR implementation lines, nor instructions executed by generated NPU
+kernels.
+
 ## How Filtering Works
 
 - `--op` matches the closest `@pytest.mark.op(...)`

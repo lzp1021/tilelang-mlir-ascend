@@ -85,9 +85,9 @@ def test_coverage_policy_measures_tilelang_branches_and_shows_missing_lines():
 
 def test_coverage_outputs_are_ignored_and_pytest_cov_is_declared():
     ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-    requirements = (REPO_ROOT / "requirements-test.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    requirements = (
+        (REPO_ROOT / "requirements-test.txt").read_text(encoding="utf-8").splitlines()
+    )
 
     assert "coverage/" in ignored
     assert "pytest-cov" in requirements
@@ -101,3 +101,12 @@ def test_npuir_workflow_runs_shared_coverage_command_and_uploads_reports():
     assert "pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
     assert "python scripts/run_python_coverage.py -v" in workflow
     assert "path: |\n          testing/npuir/output/\n          coverage/" in workflow
+
+
+def test_npuir_readme_documents_coverage_runner_and_outputs():
+    readme = (REPO_ROOT / "testing" / "npuir" / "README.md").read_text(encoding="utf-8")
+
+    assert "python scripts/run_python_coverage.py" in readme
+    assert "testing/npuir/output/report.html" in readme
+    assert "coverage/python-html/index.html" in readme
+    assert "coverage/python.xml" in readme

@@ -33,8 +33,9 @@ It runs the NPUIR operation directories represented by `testing/npuir/*_ops`. Ad
 python scripts/run_python_coverage.py --op=copy --mode=Developer --npu-device=0 -v
 ```
 
-The script always adds these outputs under `coverage/`:
+The script preserves the existing pytest HTML report and adds these coverage outputs:
 
+- `testing/npuir/output/report.html`
 - `coverage/python-html/index.html`
 - `coverage/python.xml`
 - `coverage/junit.xml`
@@ -48,7 +49,7 @@ The script exposes a small command-construction function so its behavior can be 
 The executable entry point:
 
 1. Resolves the repository root from the script location.
-2. Creates `coverage/` if necessary.
+2. Creates `coverage/` and `testing/npuir/output/` if necessary.
 3. Expands and sorts directories matching `testing/npuir/*_ops` for platform-independent behavior.
 4. Fails with a clear message if no matching test directories exist.
 5. Runs pytest from the repository root.
@@ -94,7 +95,7 @@ The tests are written before the runner implementation and must first fail becau
 ## Acceptance Criteria
 
 - `pytest-cov` is installed by the repository test requirements and the NPUIR CI job.
-- One command produces terminal, HTML, coverage XML, and JUnit XML reports.
+- One command preserves the pytest HTML report and produces terminal, coverage HTML, coverage XML, and JUnit XML reports.
 - Local and CI execution use the same runner and `.coveragerc`.
 - Existing NPUIR selection flags continue to work through argument forwarding.
 - Test failures still fail CI while coverage/test artifacts are uploaded.
