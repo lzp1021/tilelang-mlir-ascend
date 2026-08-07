@@ -1,0 +1,22 @@
+[run]
+branch = True
+relative_files = True
+source =
+    tilelang
+omit =
+    */testing/*
+    */tests/*
+    */3rdparty/*
+    */build/*
+    */dist/*
+    */__pycache__/*
+
+[report]
+show_missing = True
+skip_covered = False
+
+[html]
+directory = coverage/python-html
+
+[xml]
+output = coverage/python.xml

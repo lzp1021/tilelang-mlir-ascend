@@ -1,4 +1,5 @@
 import sys
+from configparser import ConfigParser
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,9 @@ from scripts.run_python_coverage import (
     prepare_output_directories,
     run_command,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_discover_test_paths_returns_sorted_operation_directories(tmp_path: Path):
@@ -66,3 +70,24 @@ def test_prepare_output_directories_creates_report_parents(tmp_path: Path):
 
     assert (tmp_path / "coverage").is_dir()
     assert (tmp_path / "testing" / "npuir" / "output").is_dir()
+
+
+def test_coverage_policy_measures_tilelang_branches_and_shows_missing_lines():
+    config = ConfigParser()
+    assert config.read(REPO_ROOT / ".coveragerc")
+
+    assert config.getboolean("run", "branch")
+    assert config.getboolean("run", "relative_files")
+    assert config.get("run", "source").split() == ["tilelang"]
+    assert config.getboolean("report", "show_missing")
+    assert not config.has_option("report", "fail_under")
+
+
+def test_coverage_outputs_are_ignored_and_pytest_cov_is_declared():
+    ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    requirements = (REPO_ROOT / "requirements-test.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    assert "coverage/" in ignored
+    assert "pytest-cov" in requirements
