@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Measure Python modules under `tilelang/` only; do not instrument C++, MLIR passes, generated NPU code, tests, builds, or third-party sources.
+- Measure Python modules under `tilelang/` only, including `tilelang/testing/`; do not instrument C++, MLIR passes, generated NPU code, the top-level test tree, builds, or third-party sources.
 - Keep `testing/npuir/*_ops` as the default test selection so local and CI coverage match the existing NPUIR job.
 - Preserve arbitrary pytest and NPUIR arguments such as `--op`, `--mode`, and `--npu-device` in caller order.
 - Preserve `testing/npuir/output/report.html` and produce `coverage/python-html/index.html`, `coverage/python.xml`, and `coverage/junit.xml`, plus a terminal missing-lines report.
@@ -261,8 +261,6 @@ relative_files = True
 source =
     tilelang
 omit =
-    */testing/*
-    */tests/*
     */3rdparty/*
     */build/*
     */dist/*

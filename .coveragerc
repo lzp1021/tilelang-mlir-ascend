@@ -4,8 +4,6 @@ relative_files = True
 source =
     tilelang
 omit =
-    */testing/*
-    */tests/*
     */3rdparty/*
     */build/*
     */dist/*

@@ -59,9 +59,8 @@ Forwarded arguments appear after the repository test paths and built-in report o
 
 ## Coverage Policy
 
-`.coveragerc` enables branch coverage and measures `tilelang`. It omits code that should not affect the project coverage signal:
+`.coveragerc` enables branch coverage and measures `tilelang`. Selecting that package inherently excludes the top-level test tree while retaining the production helpers under `tilelang/testing/`. It also omits code that should not affect the project coverage signal:
 
-- test trees;
 - build and distribution output;
 - third-party sources;
 - generated or cached files.

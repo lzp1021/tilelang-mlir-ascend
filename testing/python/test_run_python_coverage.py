@@ -76,9 +76,11 @@ def test_coverage_policy_measures_tilelang_branches_and_shows_missing_lines():
     config = ConfigParser()
     assert config.read(REPO_ROOT / ".coveragerc")
 
+    omitted_paths = config.get("run", "omit").split()
     assert config.getboolean("run", "branch")
     assert config.getboolean("run", "relative_files")
     assert config.get("run", "source").split() == ["tilelang"]
+    assert "*/testing/*" not in omitted_paths
     assert config.getboolean("report", "show_missing")
     assert not config.has_option("report", "fail_under")
 
