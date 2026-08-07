@@ -89,7 +89,7 @@ jobs:
         pip install torch==2.7.1 -i ${TORCH_CACHE_URL} --extra-index-url ${PYPI_CACHE_URL}
         pip install torch-npu==2.7.1
         pip install dist/*.whl
-        pip install pytest pytest-xdist pytest-html numpy
+        pip install pytest pytest-xdist pytest-html pytest-cov numpy
 
     - name: Install clang
       run: |
@@ -160,17 +160,16 @@ jobs:
     - name: Run npuir tests
       env:
         TILELANG_CLEAR_CACHE: "1"
-      run: |
-        python -m pytest -v testing/npuir/*_ops \
-          --html=testing/npuir/output/report.html --self-contained-html \
-          --junitxml=testing/npuir/output/junit.xml
+      run: python scripts/run_python_coverage.py -v
 
     - name: Upload test report
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: npuir-test-report
-        path: testing/npuir/output/
+        path: |
+          testing/npuir/output/
+          coverage/
 
   build-release:
     if: github.event_name == 'release'
