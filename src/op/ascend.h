@@ -17,7 +17,68 @@
 namespace tvm {
 namespace tl {
 
+static constexpr const char *kEnableAutoMultiBuffer =
+    "npuir.enable_auto_multi_buffer";
+static constexpr const char *kDisableHivmAutoInjectSync =
+    "npuir.disable_hivm_auto_inject_sync";
+static constexpr const char *kEnablePlanAndUpdateBufferAllocation =
+    "tl.enable_plan_and_update_buffer_allocation";
+
 using namespace tir;
+
+class NpuirOperand {
+public:
+  NpuirOperand() = default;
+
+  static NpuirOperand Tensor(Buffer buffer, Array<Range> ranges) {
+    NpuirOperand op;
+    op.kind_ = Kind::kTensor;
+    op.buffer_ = std::move(buffer);
+    op.ranges_ = std::move(ranges);
+    return op;
+  }
+
+  static NpuirOperand Scalar(PrimExpr expr) {
+    NpuirOperand op;
+    op.kind_ = Kind::kScalar;
+    op.scalar_ = std::move(expr);
+    return op;
+  }
+
+  static NpuirOperand FromExpr(const PrimExpr &expr, const BufferMap &vmap);
+
+  bool IsValid() const { return kind_ != Kind::kInvalid; }
+  bool IsTensor() const { return kind_ == Kind::kTensor; }
+  bool IsScalar() const { return kind_ == Kind::kScalar; }
+
+  const Buffer &GetBuffer() const {
+    ICHECK(IsTensor()) << "Operand is not a tensor";
+    return buffer_;
+  }
+
+  const Array<Range> &GetRanges() const {
+    ICHECK(IsTensor()) << "Operand is not a tensor";
+    return ranges_;
+  }
+
+  const PrimExpr &GetExpr() const {
+    ICHECK(IsScalar()) << "Operand is not a scalar";
+    return scalar_;
+  }
+
+private:
+  enum class Kind {
+    kInvalid,
+    kTensor,
+    kScalar,
+  };
+
+  Kind kind_{Kind::kInvalid};
+
+  Buffer buffer_;
+  Array<Range> ranges_;
+  PrimExpr scalar_;
+};
 
 class AscendCopy : public Operator {
 public:
@@ -32,15 +93,25 @@ public:
   Array<Range> src_range, dst_range;
 };
 
+class NpuirBinaryOperator : public Operator {
+public:
+  const NpuirOperand &Src0() const { return src0_; }
+  const NpuirOperand &Src1() const { return src1_; }
+  const NpuirOperand &Dst() const { return dst_; }
+
+  NpuirBinaryOperator(Array<PrimExpr> args, BufferMap vmap);
+
+protected:
+  NpuirOperand src0_;
+  NpuirOperand src1_;
+  NpuirOperand dst_;
+};
+
 #define NPUIR_BINARY_OP_CLASS(OPNAME)                                          \
-  class Npuir##OPNAME : public Operator {                                      \
+  class Npuir##OPNAME : public NpuirBinaryOperator {                           \
   public:                                                                      \
-    Npuir##OPNAME(Array<PrimExpr> args, BufferMap vmap);                       \
+    using NpuirBinaryOperator::NpuirBinaryOperator;                            \
     static const Op &Get();                                                    \
-                                                                               \
-  private:                                                                     \
-    Buffer src0, src1, dst;                                                    \
-    Array<Range> src0_range, src1_range, dst_range;                            \
   };
 
 NPUIR_BINARY_OP_CLASS(Add)
@@ -54,6 +125,7 @@ NPUIR_BINARY_OP_CLASS(And)
 NPUIR_BINARY_OP_CLASS(Xor)
 NPUIR_BINARY_OP_CLASS(Pow)
 NPUIR_BINARY_OP_CLASS(Shl)
+NPUIR_BINARY_OP_CLASS(FloorDiv)
 
 #define NPUIR_UNARY_OP_CLASS(OPNAME)                                           \
   class Npuir##OPNAME : public Operator {                                      \
@@ -75,6 +147,7 @@ NPUIR_UNARY_OP_CLASS(Rsqrt)
 NPUIR_UNARY_OP_CLASS(Abs)
 NPUIR_UNARY_OP_CLASS(Rec)
 NPUIR_UNARY_OP_CLASS(Not)
+NPUIR_UNARY_OP_CLASS(Floor)
 
 class NpuirDot : public Operator {
 public:
@@ -155,7 +228,7 @@ public:
 };
 
 /// HIVM set flag sync.
-class NpuirSetFlag: public Operator {
+class NpuirSetFlag : public Operator {
 public:
   NpuirSetFlag(Array<PrimExpr> args, BufferMap vmap);
 
@@ -168,7 +241,7 @@ public:
 };
 
 /// HIVM wait flag sync.
-class NpuirWaitFlag: public Operator {
+class NpuirWaitFlag : public Operator {
 public:
   NpuirWaitFlag(Array<PrimExpr> args, BufferMap vmap);
 
@@ -363,6 +436,20 @@ public:
   Buffer src, dst, indices;
 
   Array<Range> src_range, dst_range, indices_range;
+};
+
+/// A5 phase-1 SIMT indirect load.
+/// Load X[IDX_UB[i]] from GM and materialize the result into O_UB[i].
+class NpuirIndirectLoad : public Operator {
+public:
+  NpuirIndirectLoad(Array<PrimExpr> args, BufferMap vmap);
+
+  static const Op &Get();
+
+  Buffer src, indices_ub, dst_ub;
+  PrimExpr valid_extent;
+
+  Array<Range> src_range, indices_ub_range, dst_ub_range;
 };
 
 /// HIVM vector transpose operation

@@ -96,12 +96,12 @@ def test_coverage_outputs_are_ignored_and_pytest_cov_is_declared():
 
 
 def test_npuir_workflow_runs_shared_coverage_command_and_uploads_reports():
-    workflow = (REPO_ROOT / ".github" / "workflows" / "ci_npuir.yml").read_text(
+    workflow = (REPO_ROOT / ".github" / "workflows" / "test_npuir_wheel.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
-    assert "python scripts/run_python_coverage.py -v" in workflow
+    assert "uv pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
+    assert "python scripts/run_python_coverage.py -v -n 2" in workflow
     assert "path: |\n          testing/npuir/output/\n          coverage/" in workflow
 
 

@@ -299,7 +299,7 @@ git commit -s -m "test: configure Python branch coverage"
 ### Task 3: NPUIR CI integration
 
 **Files:**
-- Modify: `.github/workflows/ci_npuir.yml`
+- Modify: `.github/workflows/test_npuir_wheel.yml`
 - Modify: `testing/python/test_run_python_coverage.py`
 
 **Interfaces:**
@@ -312,12 +312,12 @@ Append this test to `testing/python/test_run_python_coverage.py`:
 
 ```python
 def test_npuir_workflow_runs_shared_coverage_command_and_uploads_reports():
-    workflow = (REPO_ROOT / ".github" / "workflows" / "ci_npuir.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "test_npuir_wheel.yml"
+    ).read_text(encoding="utf-8")
 
-    assert "pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
-    assert "python scripts/run_python_coverage.py -v" in workflow
+    assert "uv pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
+    assert "python scripts/run_python_coverage.py -v -n 2" in workflow
     assert "path: |\n          testing/npuir/output/\n          coverage/" in workflow
 ```
 
@@ -335,13 +335,13 @@ Expected: failure because the workflow still installs no `pytest-cov`, calls pyt
 
 - [ ] **Step 3: Update the NPUIR workflow**
 
-In `.github/workflows/ci_npuir.yml`:
+In `.github/workflows/test_npuir_wheel.yml`:
 
-- Change the explicit test dependency installation to `pip install pytest pytest-xdist pytest-html pytest-cov numpy`.
+- Change the explicit test dependency installation to `uv pip install pytest pytest-xdist pytest-html pytest-cov numpy`.
 - Replace the direct pytest block with:
 
 ```yaml
-      run: python scripts/run_python_coverage.py -v
+      run: python scripts/run_python_coverage.py -v -n 2
 ```
 
 - Change the artifact path to:
@@ -352,7 +352,7 @@ In `.github/workflows/ci_npuir.yml`:
           coverage/
 ```
 
-Keep `TILELANG_CLEAR_CACHE: "1"`, `if: always()`, and the existing artifact name unchanged.
+Keep `TILELANG_CLEAR_CACHE: "1"`, `if: always()`, the caller-provided artifact name, and upstream's two-worker test execution unchanged.
 
 - [ ] **Step 4: Run focused and full contract tests and verify GREEN**
 
@@ -367,7 +367,7 @@ Expected: `8 passed`.
 - [ ] **Step 5: Commit CI integration**
 
 ```bash
-git add .github/workflows/ci_npuir.yml testing/python/test_run_python_coverage.py
+git add .github/workflows/test_npuir_wheel.yml testing/python/test_run_python_coverage.py
 git commit -s -m "ci: collect NPUIR Python coverage"
 ```
 
@@ -446,7 +446,7 @@ Expected: prints a positive number of NPUIR test directories and exits `0`.
 Run:
 
 ```bash
-python -c "from configparser import ConfigParser; from pathlib import Path; import yaml; config = ConfigParser(); assert config.read('.coveragerc'); yaml.safe_load(Path('.github/workflows/ci_npuir.yml').read_text(encoding='utf-8')); print('configuration syntax valid')"
+python -c "from configparser import ConfigParser; from pathlib import Path; import yaml; config = ConfigParser(); assert config.read('.coveragerc'); yaml.safe_load(Path('.github/workflows/test_npuir_wheel.yml').read_text(encoding='utf-8')); print('configuration syntax valid')"
 ```
 
 Expected: `configuration syntax valid` and exit `0`.
@@ -456,7 +456,7 @@ Expected: `configuration syntax valid` and exit `0`.
 Run from a Bash-capable environment:
 
 ```bash
-bash format.sh --files scripts/run_python_coverage.py testing/python/test_run_python_coverage.py .github/workflows/ci_npuir.yml testing/npuir/README.md .coveragerc requirements-test.txt .gitignore
+bash format.sh --files scripts/run_python_coverage.py testing/python/test_run_python_coverage.py .github/workflows/test_npuir_wheel.yml testing/npuir/README.md .coveragerc requirements-test.txt .gitignore
 git diff --check
 ```
 
@@ -482,7 +482,7 @@ Before claiming completion, freshly run and record:
 
 ```bash
 python -m pytest testing/python/test_run_python_coverage.py -v
-python -c "from configparser import ConfigParser; from pathlib import Path; import yaml; config = ConfigParser(); assert config.read('.coveragerc'); yaml.safe_load(Path('.github/workflows/ci_npuir.yml').read_text(encoding='utf-8'))"
+python -c "from configparser import ConfigParser; from pathlib import Path; import yaml; config = ConfigParser(); assert config.read('.coveragerc'); yaml.safe_load(Path('.github/workflows/test_npuir_wheel.yml').read_text(encoding='utf-8'))"
 git diff --check HEAD~4..HEAD
 git status --short
 ```

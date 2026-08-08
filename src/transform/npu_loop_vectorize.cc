@@ -36,6 +36,9 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <optional>
+#include <sstream>
+
 #include "arith/scalable_expression.h"
 #include "tir/analysis/check_contains.h"
 
@@ -58,6 +61,7 @@ private:
   // inner).
   std::vector<const VarNode *> current_loop_vars_;
   std::vector<int64_t> current_loop_extents_;
+  std::vector<PrimExpr> current_loop_mins_;
 
   // Statements that need to be hoisted before the outermost parallel loop
   // (copy / reshape / brc).
@@ -68,45 +72,42 @@ private:
   // ============================================================
 
   inline static std::unordered_map<std::string, std::string> TirOps2NpuirOps = {
-      {"tir.exp", "tl.npuir_exp"},
-      {"tir.fabs", "tl.npuir_abs"},
-      {"tir.sigmoid", "tl.npuir_sigmoid"},
-      {"tir.if_then_else", "tl.npuir_select"},
-      {"Add", "tl.npuir_add"},
-      {"Mul", "tl.npuir_mul"},
-      {"Sub", "tl.npuir_sub"},
-      {"Div", "tl.npuir_div"},
-      {"EQ", "tl.npuir_cmp"},
-      {"NE", "tl.npuir_cmp"},
-      {"LT", "tl.npuir_cmp"},
-      {"LE", "tl.npuir_cmp"},
-      {"GE", "tl.npuir_cmp"},
-      {"GT", "tl.npuir_cmp"},
-      {"Broadcast", "tl.npuir_brc"},
-      {"Copy", "tl.copy"},
+      {"tir.exp", "tl.npuir_exp"},     {"tir.fabs", "tl.npuir_abs"},
+      {"tir.log", "tl.npuir_ln"},      {"tir.sqrt", "tl.npuir_sqrt"},
+      {"tir.rsqrt", "tl.npuir_rsqrt"}, {"tir.sigmoid", "tl.npuir_sigmoid"},
+      {"Cast", "tl.npuir_cast"},       {"tir.if_then_else", "tl.npuir_select"},
+      {"Add", "tl.npuir_add"},         {"Mul", "tl.npuir_mul"},
+      {"Sub", "tl.npuir_sub"},         {"Div", "tl.npuir_div"},
+      {"Min", "tl.npuir_min"},         {"Max", "tl.npuir_max"},
+      {"EQ", "tl.npuir_cmp"},          {"NE", "tl.npuir_cmp"},
+      {"LT", "tl.npuir_cmp"},          {"LE", "tl.npuir_cmp"},
+      {"GE", "tl.npuir_cmp"},          {"GT", "tl.npuir_cmp"},
+      {"Broadcast", "tl.npuir_brc"},   {"Copy", "tl.copy"},
   };
 
   // ============================================================
-  // RAII depth management — prevents forgetting to reset depth to 0 on return.
+  // RAII depth management: restores the caller's nesting depth on return.
   // ============================================================
 
   struct DepthGuard {
     int &depth;
+    int saved_depth;
     bool committed = false;
 
-    explicit DepthGuard(int &d) : depth(d) { depth++; }
+    explicit DepthGuard(int &d) : depth(d), saved_depth(d) { depth++; }
 
     // Call when the operation completes successfully; decrements depth.
     void commit() {
-      depth--;
+      depth = saved_depth;
       committed = true;
     }
 
-    // If commit() was never called (i.e. an early failure occurred), reset
-    // depth to 0.
+    // If commit() was never called (i.e. an early failure occurred), restore
+    // the caller's depth. Nested fallback attempts must not make the caller
+    // look like a top-level expression.
     ~DepthGuard() {
       if (!committed)
-        depth = 0;
+        depth = saved_depth;
     }
   };
 
@@ -120,25 +121,76 @@ private:
     return cmp_ops.count(op);
   }
 
+  bool IsFloat16Or32(const DataType &dtype) {
+    return dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32);
+  }
+
+  bool IsNpuirDivDtypeSupported(const DataType &dtype) {
+    return IsFloat16Or32(dtype) || (dtype.is_int() && dtype.bits() == 64);
+  }
+
+  bool CanLowerBinaryOpToNpuir(const std::string &op_name,
+                               const DataType &result_dtype) {
+    if (op_name == "Div" || op_name == "FloorDiv" || op_name == "FloorMod") {
+      // Reject dtypes that vdiv cannot lower before floor ops expand.
+      // Example: int32 x % y would become vdiv/vmul/vsub on int32 buffers.
+      return IsNpuirDivDtypeSupported(result_dtype);
+    }
+    return true;
+  }
+
+  DataType PromoteFloatComputeDType(DataType current,
+                                    const DataType &candidate) {
+    if (candidate.is_float() &&
+        (!current.is_float() || candidate.bits() > current.bits())) {
+      return candidate;
+    }
+    return current;
+  }
+
   bool IsScalar(const PrimExpr &expr) {
     return expr.as<IntImmNode>() || expr.as<FloatImmNode>();
+  }
+
+  bool UsesLoopVar(const PrimExpr &expr, const VarNode *loop_var) {
+    return tir::UsesVar(expr,
+                        [loop_var](const VarNode *v) { return v == loop_var; });
+  }
+
+  bool ContainsAnyLoopVar(const PrimExpr &expr,
+                          const std::vector<const VarNode *> &loop_vars) {
+    for (auto lv : loop_vars) {
+      if (UsesLoopVar(expr, lv))
+        return true;
+    }
+    return false;
+  }
+
+  int FindMappedLoopVar(const PrimExpr &expr,
+                        const std::vector<const VarNode *> &loop_vars) {
+    int mapped = -1;
+    for (int i = 0; i < static_cast<int>(loop_vars.size()); ++i) {
+      if (!UsesLoopVar(expr, loop_vars[i]))
+        continue;
+      if (mapped != -1)
+        return -2;
+      mapped = i;
+    }
+    return mapped;
   }
 
   bool IsLoopInvariant(const Array<PrimExpr> &indices,
                        const std::vector<const VarNode *> &loop_vars) {
     for (const auto &idx : indices) {
-      if (auto var = idx.as<VarNode>()) {
-        for (auto lv : loop_vars) {
-          if (lv == var)
-            return false;
-        }
-      }
+      if (ContainsAnyLoopVar(idx, loop_vars))
+        return false;
     }
     return true;
   }
 
-  bool IsScalarLike(const PrimExpr &expr,
-                    const std::vector<const VarNode *> &loop_vars) {
+  bool
+  IsLoopInvariantScalarLike(const PrimExpr &expr,
+                            const std::vector<const VarNode *> &loop_vars) {
     if (IsScalar(expr))
       return true;
     if (auto var = expr.as<VarNode>()) {
@@ -152,19 +204,64 @@ private:
     return false;
   }
 
-  // Each component of indices must be either an integer constant or an integer
-  // variable.
   bool ValidBufferIndices(const Array<PrimExpr> &indices) {
     for (const auto &idx : indices) {
-      if (idx.as<IntImmNode>())
-        continue;
-      if (auto var = idx.as<VarNode>()) {
-        if (var->dtype.is_int())
-          continue;
-      }
-      return false;
+      if (!idx.dtype().is_int())
+        return false;
     }
     return true;
+  }
+
+  // Simplify a PrimExpr with a fresh arithmetic analyzer so later shape/index
+  // checks can reason about a canonicalized form instead of the original
+  // syntax.
+  PrimExpr SimplifyExpr(const PrimExpr &expr) {
+    arith::Analyzer analyzer;
+    return analyzer.Simplify(expr);
+  }
+
+  bool IsLoopInvariantExpr(const PrimExpr &expr,
+                           const std::vector<const VarNode *> &loop_vars) {
+    return !ContainsAnyLoopVar(expr, loop_vars);
+  }
+
+  // Accept loop_var, loop_var +/- invariant, and invariant + loop_var.
+  // This is the unit-stride subset that remains a linear contiguous access.
+  bool IsUnitStrideLoopIndex(const PrimExpr &expr, const VarNode *loop_var,
+                             const std::vector<const VarNode *> &loop_vars) {
+    if (auto var = expr.as<VarNode>())
+      return var == loop_var;
+    if (auto cast = expr.as<CastNode>())
+      return IsUnitStrideLoopIndex(cast->value, loop_var, loop_vars);
+    if (auto add = expr.as<AddNode>()) {
+      return (IsUnitStrideLoopIndex(add->a, loop_var, loop_vars) &&
+              IsLoopInvariantExpr(add->b, loop_vars)) ||
+             (IsLoopInvariantExpr(add->a, loop_vars) &&
+              IsUnitStrideLoopIndex(add->b, loop_var, loop_vars));
+    }
+    if (auto sub = expr.as<SubNode>()) {
+      return IsUnitStrideLoopIndex(sub->a, loop_var, loop_vars) &&
+             IsLoopInvariantExpr(sub->b, loop_vars);
+    }
+    return false;
+  }
+
+  // A BufferLoad index is supported when simplification turns it into either
+  // a loop-invariant expression or a single-loop-var unit-stride expression.
+  bool IsSupportedVectorLoadIndex(const PrimExpr &expr,
+                                  const std::vector<const VarNode *> &loop_vars,
+                                  PrimExpr *simplified_out = nullptr) {
+    PrimExpr simplified = SimplifyExpr(expr);
+    if (simplified_out)
+      *simplified_out = simplified;
+
+    if (IsLoopInvariantExpr(simplified, loop_vars))
+      return true;
+
+    int mapped = FindMappedLoopVar(simplified, loop_vars);
+    if (mapped < 0)
+      return false;
+    return IsUnitStrideLoopIndex(simplified, loop_vars[mapped], loop_vars);
   }
 
   // ============================================================
@@ -172,10 +269,13 @@ private:
   // ============================================================
 
   bool IsUnaryOp(const PrimExpr &expr) {
+    if (expr.as<CastNode>())
+      return true;
     if (auto call = expr.as<CallNode>()) {
       if (auto op = call->op.as<OpNode>()) {
         return op->name == "tir.exp" || op->name == "tir.fabs" ||
-               op->name == "tir.sigmoid";
+               op->name == "tir.log" || op->name == "tir.sqrt" ||
+               op->name == "tir.rsqrt" || op->name == "tir.sigmoid";
       }
     }
     return false;
@@ -197,6 +297,10 @@ private:
     HANDLE_BINARY_OP(MulNode, "Mul")
     HANDLE_BINARY_OP(SubNode, "Sub")
     HANDLE_BINARY_OP(DivNode, "Div")
+    HANDLE_BINARY_OP(FloorDivNode, "FloorDiv")
+    HANDLE_BINARY_OP(FloorModNode, "FloorMod")
+    HANDLE_BINARY_OP(MinNode, "Min")
+    HANDLE_BINARY_OP(MaxNode, "Max")
     HANDLE_BINARY_OP(LTNode, "LT")
     HANDLE_BINARY_OP(LENode, "LE")
     HANDLE_BINARY_OP(GENode, "GE")
@@ -246,18 +350,44 @@ private:
     return Buffer(buf_var, dtype, shape, {}, PrimExpr(0), name, 0, 0, kDefault);
   }
 
+  std::string NextTempBufferName(const std::string &prefix = "tmp") {
+    static int tmp_id = 0;
+    return prefix + "_" + std::to_string(tmp_id++) + "_buf";
+  }
+
   // Create a temporary buffer with the same shape / scope as the reference
   // BufferAccessInfo and register it in tmp_buffers.
-  BufferAccessInfo CreateTempBuffer(const BufferAccessInfo &ref,
-                                    const std::string &op_name = "npuir_add") {
-    static int tmp_id = 0;
+  BufferAccessInfo
+  CreateTempBuffer(const BufferAccessInfo &ref,
+                   const std::string &op_name = "npuir_add",
+                   std::optional<DataType> dtype_override = std::nullopt) {
     const Buffer &ref_buf = ref.buffer;
-    DataType dtype = IsCmpOp(op_name) ? DataType::Bool() : ref_buf->dtype;
-    std::string name = "tmp_" + std::to_string(tmp_id++) + "_buf";
+    DataType dtype = IsCmpOp(op_name) ? DataType::Bool()
+                                      : dtype_override.value_or(ref_buf->dtype);
+    std::string name = NextTempBufferName();
     Buffer buf(Var(name, PointerType(PrimType(dtype), ref_buf.scope())), dtype,
                ref_buf->shape, {}, PrimExpr(0), name, 0, 0, kDefault);
     tmp_buffers.push_back(buf);
     return {buf, ref.indices, true};
+  }
+
+  DataType
+  InferBinaryComputeDType(const std::string &op_name,
+                          const DataType &result_dtype,
+                          const std::optional<BufferAccessInfo> &resolved_a,
+                          const std::optional<BufferAccessInfo> &resolved_b,
+                          const Array<PrimExpr> &operands) {
+    if (IsCmpOp(op_name))
+      return DataType::Bool();
+
+    DataType dtype = result_dtype;
+    if (resolved_a)
+      dtype = PromoteFloatComputeDType(dtype, resolved_a->buffer->dtype);
+    if (resolved_b)
+      dtype = PromoteFloatComputeDType(dtype, resolved_b->buffer->dtype);
+    for (const auto &operand : operands)
+      dtype = PromoteFloatComputeDType(dtype, operand.dtype());
+    return dtype;
   }
 
   // ============================================================
@@ -287,6 +417,35 @@ private:
     return Call(DataType::Handle(), Op::Get("tl.region"), args);
   }
 
+  std::vector<PrimExpr> MakeZeroOffsets(int n) {
+    std::vector<PrimExpr> v;
+    v.reserve(n);
+    for (int i = 0; i < n; i++)
+      v.push_back(make_const(DataType::Int(32), 0));
+    return v;
+  }
+
+  Array<PrimExpr> ToShapeExpr(const std::vector<int64_t> &shape) {
+    Array<PrimExpr> arr;
+    for (auto v : shape)
+      arr.push_back(make_const(DataType::Int(32), v));
+    return arr;
+  }
+
+  std::vector<int64_t>
+  GetAlignedLoopShape(const BufferAccessInfo &ref,
+                      const std::vector<const VarNode *> &loop_vars,
+                      const std::vector<int64_t> &loop_extents) {
+    int ndim = ref.indices.size();
+    std::vector<int64_t> shape(ndim, 1);
+    for (int i = 0; i < ndim; ++i) {
+      int mapped = FindMappedLoopVar(ref.indices[i], loop_vars);
+      if (mapped >= 0)
+        shape[i] = loop_extents[mapped];
+    }
+    return shape;
+  }
+
   // ============================================================
   // NPUIR instruction construction
   // ============================================================
@@ -310,6 +469,13 @@ private:
   // Unary: region_in -> out
   Stmt BuildUnaryStmt(const std::string &op_name, const PrimExpr &region_in,
                       const BufferAccessInfo &out) {
+    if (op_name == "Cast") {
+      // Parallel cast lowering currently uses the default npuir round mode.
+      // CastNode itself does not carry alternative floor/trunc round metadata
+      // here.
+      return BuildNpuirCall(
+          op_name, {region_in, BuildRegionCall(out, 2, 1), StringImm("rint")});
+    }
     return BuildNpuirCall(op_name, {region_in, BuildRegionCall(out, 2, 1)});
   }
 
@@ -357,16 +523,8 @@ private:
     int N = loop_vars.size();
     info.index_to_loop.assign(load->indices.size(), -1);
 
-    for (int i = 0; i < (int)load->indices.size(); i++) {
-      if (auto var = load->indices[i].as<VarNode>()) {
-        for (int j = 0; j < N; j++) {
-          if (loop_vars[j] == var) {
-            info.index_to_loop[i] = j;
-            break;
-          }
-        }
-      }
-    }
+    for (int i = 0; i < (int)load->indices.size(); i++)
+      info.index_to_loop[i] = FindMappedLoopVar(load->indices[i], loop_vars);
 
     std::set<int> used(info.index_to_loop.begin(), info.index_to_loop.end());
     used.erase(-1);
@@ -420,7 +578,7 @@ private:
 
     // 1. local_buf: copy from the original buffer into a local-scope buffer.
     Buffer local_buf =
-        CreateTempBufferWithShape(to_shape_expr(rbi.src_sizes),
+        CreateTempBufferWithShape(ToShapeExpr(rbi.src_sizes),
                                   load->buffer->dtype, "local_src_buf", scope);
     tmp_buffers.push_back(local_buf);
 
@@ -431,7 +589,7 @@ private:
                                 ? make_const(DataType::Int(32), 0)
                                 : load->indices[i]);
 
-    auto local_offsets = make_zero_offsets((int)rbi.src_sizes.size());
+    auto local_offsets = MakeZeroOffsets((int)rbi.src_sizes.size());
 
     hoisted_stmts_.push_back(
         Evaluate(Call(DataType::Void(), Op::Get("tl.copy"),
@@ -460,7 +618,7 @@ private:
         "reshape_view_buf", scope);
     tmp_buffers.push_back(view_buf);
 
-    auto view_offsets = make_zero_offsets(out_dim);
+    auto view_offsets = MakeZeroOffsets(out_dim);
 
     hoisted_stmts_.push_back(Evaluate(
         Call(DataType::Void(), Op::Get("tl.npuir_reshape"),
@@ -487,12 +645,12 @@ private:
     }
 
     // 3. brc_buf: broadcast view_buf to aligned_brc_shape.
-    Buffer brc_buf = CreateTempBufferWithShape(to_shape_expr(aligned_brc_shape),
+    Buffer brc_buf = CreateTempBufferWithShape(ToShapeExpr(aligned_brc_shape),
                                                load->buffer->dtype, "brc_buf",
                                                scope, op_name);
     tmp_buffers.push_back(brc_buf);
 
-    auto brc_offsets = make_zero_offsets(out_dim);
+    auto brc_offsets = MakeZeroOffsets(out_dim);
     hoisted_stmts_.push_back(
         Evaluate(Call(DataType::Void(), Op::Get("tl.npuir_brc"),
                       {RegionND(view_buf, view_offsets, 1, aligned_view_shape),
@@ -501,14 +659,49 @@ private:
     return {brc_buf, output_ref.indices, true};
   }
 
+  std::optional<BufferAccessInfo>
+  EmitLoopVarArange(const VarNode *loop_var, const BufferAccessInfo &output_ref,
+                    const std::vector<const VarNode *> &loop_vars,
+                    const std::vector<int64_t> &loop_extents) {
+    int loop_idx = -1;
+    for (int i = 0; i < static_cast<int>(loop_vars.size()); ++i) {
+      if (loop_vars[i] == loop_var) {
+        loop_idx = i;
+        break;
+      }
+    }
+    if (loop_idx < 0)
+      return std::nullopt;
+
+    std::vector<int64_t> aligned_shape =
+        GetAlignedLoopShape(output_ref, loop_vars, loop_extents);
+    Buffer arange_buf =
+        CreateTempBufferWithShape(ToShapeExpr(aligned_shape), DataType::Int(32),
+                                  "arange_buf", output_ref.buffer.scope());
+    tmp_buffers.push_back(arange_buf);
+
+    auto zero_offsets = MakeZeroOffsets(static_cast<int>(aligned_shape.size()));
+    Array<PrimExpr> args = {
+        RegionND(arange_buf, zero_offsets, 2, aligned_shape)};
+    for (int i = 0; i < static_cast<int>(output_ref.indices.size()); ++i) {
+      int mapped = FindMappedLoopVar(output_ref.indices[i], loop_vars);
+      args.push_back(make_const(DataType::Int(32), mapped == loop_idx ? 1 : 0));
+    }
+
+    PrimExpr offset = loop_idx < static_cast<int>(current_loop_mins_.size())
+                          ? current_loop_mins_[loop_idx]
+                          : make_const(DataType::Int(32), 0);
+    args.push_back(offset);
+    hoisted_stmts_.push_back(
+        Evaluate(Call(DataType::Void(), Op::Get("tl.npuir_arange"), args)));
+    return BufferAccessInfo{arange_buf, output_ref.indices, true};
+  }
+
   // ============================================================
   // Unified operand resolution
   // ============================================================
 
-  // Return value semantics:
-  //   nullopt           -> scalar / loop-invariant; caller uses the raw
-  //   PrimExpr directly. BufferAccessInfo  -> buffer info suitable for
-  //   BuildRegionCall.
+  // Resolve an operand into either a scalar-like expression or a vector source.
   std::optional<BufferAccessInfo>
   ResolveOperand(const PrimExpr &operand, const BufferAccessInfo &output_ref,
                  std::vector<BufferAccessInfo> *tmp_bufs,
@@ -516,21 +709,47 @@ private:
                  const std::vector<int64_t> &loop_extents, Array<Stmt> *stmts,
                  const std::string &op_name = "") {
 
-    if (IsScalarLike(operand, loop_vars))
+    // Keep loop-invariant operands as scalar expressions.
+    if (IsLoopInvariantScalarLike(operand, loop_vars))
       return std::nullopt;
 
+    // Materialize the loop var into a temporary buffer via tl.npuir_arange.
+    if (auto var = operand.as<VarNode>()) {
+      auto materialized =
+          EmitLoopVarArange(var, output_ref, loop_vars, loop_extents);
+      if (materialized) {
+        tmp_bufs->push_back(*materialized);
+        return materialized;
+      }
+      return std::nullopt;
+    }
+
+    // Simplify BufferLoad indices first, then reuse the normal load/reshape
+    // path.
     if (auto load = operand.as<BufferLoadNode>()) {
       if (!ValidBufferIndices(load->indices))
         return std::nullopt;
-      auto rbi = CheckNeedsReshapeBrc(load, loop_vars, loop_extents,
-                                      (int)output_ref.indices.size());
+
+      Array<PrimExpr> simplified_indices;
+      for (const auto &idx : load->indices) {
+        PrimExpr simplified_idx;
+        if (!IsSupportedVectorLoadIndex(idx, loop_vars, &simplified_idx))
+          return std::nullopt;
+        simplified_indices.push_back(simplified_idx);
+      }
+
+      BufferLoad simplified_load(load->buffer, simplified_indices);
+      auto rbi =
+          CheckNeedsReshapeBrc(simplified_load.as<BufferLoadNode>(), loop_vars,
+                               loop_extents, (int)output_ref.indices.size());
       if (rbi.needed) {
         auto expanded = EmitReshapeAndBroadcast(
-            load, rbi, output_ref, loop_vars, loop_extents, op_name);
+            simplified_load.as<BufferLoadNode>(), rbi, output_ref, loop_vars,
+            loop_extents, op_name);
         tmp_bufs->push_back(expanded);
         return expanded;
       }
-      return ExtractBufferAccessInfo(operand);
+      return BufferAccessInfo{load->buffer, simplified_indices, true};
     }
 
     // Complex sub-expression: decompose recursively; result lands in the
@@ -557,11 +776,41 @@ private:
                              Array<Stmt> *stmts) {
     DepthGuard guard(depth);
 
-    auto *call = expr.as<CallNode>();
-    std::string op_name = call->op.as<OpNode>()->name;
+    PrimExpr operand;
+    std::string op_name;
+    if (auto *cast = expr.as<CastNode>()) {
+      op_name = "Cast";
+      operand = cast->value;
 
-    auto resolved = ResolveOperand(call->args[0], output_ref, tmp_bufs,
-                                   loop_vars, loop_extents, stmts, op_name);
+      if (auto load = operand.as<BufferLoadNode>()) {
+        if (load->indices.size() > output_ref.indices.size()) {
+          // Keep rank-reducing Cast expressions on the scalar fallback path.
+          // Vector VCast requires UB regions with compatible rank/alignment;
+          // short slices such as [1, 4] -> [4] can fault at runtime. Rank
+          // expansion, e.g. weight[j] -> [M, N], is handled below by first
+          // reshape+broadcasting the source load and then casting the result.
+          return false;
+        }
+      }
+
+      std::ostringstream os;
+      os << expr;
+      static std::unordered_set<std::string> warned_parallel_cast_exprs;
+      std::string expr_str = os.str();
+      if (warned_parallel_cast_exprs.insert(expr_str).second) {
+        LOG(WARNING) << "Parallel cast lowering uses fixed round mode 'rint'; "
+                     << "non-default floor/trunc cast expectations are not "
+                        "preserved for cast expr: "
+                     << expr_str;
+      }
+    } else {
+      auto *call = expr.as<CallNode>();
+      op_name = call->op.as<OpNode>()->name;
+      operand = call->args[0];
+    }
+
+    auto resolved = ResolveOperand(operand, output_ref, tmp_bufs, loop_vars,
+                                   loop_extents, stmts, op_name);
     if (!resolved)
       return false;
 
@@ -569,7 +818,13 @@ private:
     // result in a temporary buffer.
     BufferAccessInfo output = output_ref;
     if (depth > 1) {
-      output = CreateTempBuffer(*resolved);
+      std::string name = NextTempBufferName();
+      Buffer buf(Var(name, PointerType(PrimType(expr.dtype()),
+                                       resolved->buffer.scope())),
+                 expr.dtype(), resolved->buffer->shape, {}, PrimExpr(0), name,
+                 0, 0, kDefault);
+      tmp_buffers.push_back(buf);
+      output = {buf, resolved->indices, true};
       tmp_bufs->push_back(output);
     }
 
@@ -581,17 +836,24 @@ private:
 
   bool HandleBinaryExpression(std::string op_name,
                               const Array<PrimExpr> &operands,
+                              const DataType &result_dtype,
                               const BufferAccessInfo &output_ref,
                               std::vector<BufferAccessInfo> *tmp_bufs,
                               const std::vector<const VarNode *> &loop_vars,
                               const std::vector<int64_t> &loop_extents,
                               Array<Stmt> *stmts) {
     DepthGuard guard(depth);
-    auto resolved_a = ResolveOperand(operands[0], output_ref, tmp_bufs,
-                                     loop_vars, loop_extents, stmts, op_name);
-    auto resolved_b = ResolveOperand(operands[1], output_ref, tmp_bufs,
-                                     loop_vars, loop_extents, stmts, op_name);
-    // Both operands are scalar — cannot vectorize.
+    if (!CanLowerBinaryOpToNpuir(op_name, result_dtype))
+      return false;
+
+    std::string resolve_op_name = op_name == "FloorDiv" ? "Div" : op_name;
+    auto resolved_a =
+        ResolveOperand(operands[0], output_ref, tmp_bufs, loop_vars,
+                       loop_extents, stmts, resolve_op_name);
+    auto resolved_b =
+        ResolveOperand(operands[1], output_ref, tmp_bufs, loop_vars,
+                       loop_extents, stmts, resolve_op_name);
+    // Both operands are scalar; cannot vectorize.
     if (!resolved_a && !resolved_b)
       return false;
 
@@ -599,13 +861,18 @@ private:
         resolved_a ? BuildRegionCall(*resolved_a, 1, 1) : operands[0];
     PrimExpr region_b =
         resolved_b ? BuildRegionCall(*resolved_b, 1, 1) : operands[1];
+    std::string binary_op_name = resolve_op_name;
+    DataType compute_dtype = InferBinaryComputeDType(
+        binary_op_name, result_dtype, resolved_a, resolved_b, operands);
 
     if (!resolved_a) {
-      if (op_name == "Add" || op_name == "Mul" || IsCmpOp(op_name)) {
-        if (op_name == "LT")
-          op_name = "GT";
-        if (op_name == "LE")
-          op_name = "GE";
+      if (binary_op_name == "Add" || binary_op_name == "Mul" ||
+          binary_op_name == "Min" || binary_op_name == "Max" ||
+          IsCmpOp(binary_op_name)) {
+        if (binary_op_name == "LT")
+          binary_op_name = "GT";
+        if (binary_op_name == "LE")
+          binary_op_name = "GE";
         std::swap(region_a, region_b);
       } else {
         if (IsScalar(operands[0]) || operands[0].as<VarNode>()) {
@@ -613,7 +880,8 @@ private:
         } else {
           // BufferLoad or compound expression: broadcast to tmp buffer.
           const BufferAccessInfo &ref = *resolved_b;
-          auto scalar_buf = CreateTempBuffer(ref, op_name);
+          auto scalar_buf =
+              CreateTempBuffer(ref, binary_op_name, compute_dtype);
           tmp_bufs->push_back(scalar_buf);
           stmts->push_back(BuildNpuirCall(
               "Broadcast", {operands[0], BuildRegionCall(scalar_buf, 2, 1)}));
@@ -628,7 +896,7 @@ private:
       } else {
         // BufferLoad or compound expression: broadcast to tmp buffer.
         const BufferAccessInfo &ref = *resolved_a;
-        auto scalar_buf = CreateTempBuffer(ref, op_name);
+        auto scalar_buf = CreateTempBuffer(ref, binary_op_name, compute_dtype);
         tmp_bufs->push_back(scalar_buf);
         stmts->push_back(BuildNpuirCall(
             "Broadcast", {operands[1], BuildRegionCall(scalar_buf, 2, 1)}));
@@ -637,12 +905,35 @@ private:
     }
 
     const BufferAccessInfo &ref = resolved_a ? *resolved_a : *resolved_b;
+
+    if (op_name == "FloorMod") {
+      auto quotient = CreateTempBuffer(ref, "Div", compute_dtype);
+      tmp_bufs->push_back(quotient);
+      stmts->push_back(BuildBinaryStmt("Div", region_a, region_b, quotient));
+
+      auto product = CreateTempBuffer(ref, "Mul", compute_dtype);
+      tmp_bufs->push_back(product);
+      stmts->push_back(BuildBinaryStmt("Mul", BuildRegionCall(quotient, 1, 1),
+                                       region_b, product));
+
+      BufferAccessInfo output = output_ref;
+      if (depth > 1) {
+        output = CreateTempBuffer(ref, "Sub", compute_dtype);
+        tmp_bufs->push_back(output);
+      }
+      stmts->push_back(BuildBinaryStmt("Sub", region_a,
+                                       BuildRegionCall(product, 1, 1), output));
+      guard.commit();
+      return true;
+    }
+
     BufferAccessInfo output = output_ref;
     if (depth > 1) {
-      output = CreateTempBuffer(ref, op_name);
+      output = CreateTempBuffer(ref, binary_op_name, compute_dtype);
       tmp_bufs->push_back(output);
     }
-    stmts->push_back(BuildBinaryStmt(op_name, region_a, region_b, output));
+    stmts->push_back(
+        BuildBinaryStmt(binary_op_name, region_a, region_b, output));
     guard.commit();
     return true;
   }
@@ -664,7 +955,7 @@ private:
                 "npuir_add") -> std::optional<BufferAccessInfo> {
       // Case 1: simple scalar (IntImm/FloatImm/VarNode/loop-invariant
       // BufferLoad)
-      if (IsScalarLike(e, loop_vars)) {
+      if (IsLoopInvariantScalarLike(e, loop_vars)) {
         auto tmp = CreateTempBuffer(output_ref, tmp_op);
         tmp_bufs->push_back(tmp);
         stmts->push_back(BuildUnaryStmt("Broadcast", e, tmp));
@@ -677,7 +968,7 @@ private:
       if (resolved)
         return resolved;
 
-      // Case 3: ResolveOperand failed — e is a pure scalar compound expression
+      // Case 3: ResolveOperand failed - e is a pure scalar compound expression
       // (e.g. `1 <= cid`, neither side contains a loop variable).
       // Verify that e contains no loop variables before broadcasting.
       bool contains_loop_var = false;
@@ -749,7 +1040,20 @@ private:
       return true;
     }
 
-    if (IsScalarLike(expr, loop_vars)) {
+    if (expr.as<VarNode>()) {
+      DepthGuard guard(depth);
+      auto resolved = ResolveOperand(expr, output_ref, tmp_bufs, loop_vars,
+                                     loop_extents, stmts);
+      if (!resolved)
+        return false;
+      stmts->push_back(
+          BuildNpuirCall("Copy", {BuildRegionCall(*resolved, 1, 1),
+                                  BuildRegionCall(output_ref, 2, 1)}));
+      guard.commit();
+      return true;
+    }
+
+    if (IsLoopInvariantScalarLike(expr, loop_vars)) {
       DepthGuard guard(depth);
       stmts->push_back(BuildUnaryStmt("Broadcast", expr, output_ref));
       guard.commit();
@@ -763,8 +1067,8 @@ private:
     std::string op_type;
     Array<PrimExpr> operands;
     if (IsBinaryOp(expr, &op_type, &operands))
-      return HandleBinaryExpression(op_type, operands, output_ref, tmp_bufs,
-                                    loop_vars, loop_extents, stmts);
+      return HandleBinaryExpression(op_type, operands, expr.dtype(), output_ref,
+                                    tmp_bufs, loop_vars, loop_extents, stmts);
 
     if (IsTernaryOp(expr))
       return HandleTernaryExpression(expr, output_ref, tmp_bufs, loop_vars,
@@ -803,6 +1107,80 @@ private:
   // Single-statement vectorization
   // ============================================================
 
+  // Check whether every buffer load in the RHS expression can be decomposed
+  // into regions that LoopVectorize will later be able to merge.  A buffer
+  // load whose innermost loop var sits in dimension d is only decomposable
+  // when every dimension after d has buffer size 1 — otherwise the scalar
+  // regions that DecomposeExpression creates (all sizes = 1) will fail the
+  // CheckContinuity test (size != buffer.shape[i] for i > loop_var_dim),
+  // leaving unmerged npuir calls inside a parallel loop that the codegen
+  // mis-lowers (dynamic tensor.empty with missing dynamic sizes).
+  static bool
+  CanDecomposeBufferAccess(const PrimExpr &expr,
+                           const std::vector<const VarNode *> &loop_vars) {
+    struct Checker : public ExprVisitor {
+      const std::vector<const VarNode *> &loop_vars;
+      bool ok = true;
+
+      explicit Checker(const std::vector<const VarNode *> &lv)
+          : loop_vars(lv) {}
+
+      void VisitExpr_(const BufferLoadNode *op) override {
+        if (!ok)
+          return;
+
+        const VarNode *inner = loop_vars.back();
+        int d = -1;
+        for (size_t i = 0; i < op->indices.size(); ++i) {
+          if (tir::UsesVar(op->indices[i],
+                           [inner](const VarNode *v) { return v == inner; })) {
+            if (d >= 0) {
+              d = -2;
+              break;
+            }
+            d = static_cast<int>(i);
+          }
+        }
+
+        // -1: loop-invariant — decomposition handles this via broadcast.
+        // -2: loop var used indirectly or in multiple dimensions — the
+        //     resulting scalar regions cannot be merged into a single vector
+        //     region later, so decomposition would leave unvectorizable npuir
+        //     calls behind.
+        if (d == -2) {
+          ok = false;
+          return;
+        }
+        if (d < 0) {
+          // -1: loop-invariant for this buffer, but still recurse into
+          // indices in case they contain nested BufferLoads that do use
+          // the loop var (e.g. scales[index_buf[i, 1], 1]).
+          ExprVisitor::VisitExpr_(op);
+          return;
+        }
+
+        // For every dimension after the loop-var dimension, the buffer must
+        // be size 1.  DecomposeExpression creates scalar regions (all region
+        // sizes = 1), and CheckContinuity requires size == buffer.shape[i]
+        // for i > loop_var_dim.
+        for (size_t i = d + 1; i < op->buffer->shape.size(); ++i) {
+          const auto *imm = op->buffer->shape[i].as<IntImmNode>();
+          if (!imm || imm->value != 1) {
+            ok = false;
+            return;
+          }
+        }
+
+        // Recurse into indices to check nested BufferLoads.
+        ExprVisitor::VisitExpr_(op);
+      }
+    };
+
+    Checker checker(loop_vars);
+    checker(expr);
+    return checker.ok;
+  }
+
   Stmt VectorizeSingleStatement(const ForNode *op) {
     const auto *store = op->body.as<BufferStoreNode>();
 
@@ -811,6 +1189,10 @@ private:
       if (!idx.as<VarNode>() && !IsScalar(idx))
         return StmtMutator::VisitStmt_(op);
     }
+
+    // Bail out early when a buffer load in the RHS cannot be vectorized.
+    if (!CanDecomposeBufferAccess(store->value, current_loop_vars_))
+      return StmtMutator::VisitStmt_(op);
 
     Array<Stmt> stmts;
     std::vector<BufferAccessInfo> tmp_bufs;
@@ -862,6 +1244,7 @@ private:
     bool is_outermost = current_loop_vars_.empty();
     current_loop_vars_.push_back(op->loop_var.get());
     current_loop_extents_.push_back(ext_imm->value);
+    current_loop_mins_.push_back(op->min);
 
     Stmt result;
     if (!op->body.as<BufferStoreNode>()) {
@@ -876,6 +1259,7 @@ private:
 
     current_loop_vars_.pop_back();
     current_loop_extents_.pop_back();
+    current_loop_mins_.pop_back();
 
     // After processing the outermost parallel loop, prepend all hoisted
     // statements before it.
@@ -895,9 +1279,11 @@ private:
 class LoopVectorize : public StmtMutator {
 private:
   inline static std::unordered_set<std::string> CandidateVectorizationOps = {
-      "tl.copy",      "tl.npuir_exp", "tl.npuir_abs",    "tl.npuir_add",
-      "tl.npuir_mul", "tl.npuir_sub", "tl.npuir_div",    "tl.npuir_sigmoid",
-      "tl.npuir_brc", "tl.npuir_cmp", "tl.npuir_select",
+      "tl.copy",       "tl.npuir_exp",  "tl.npuir_abs",   "tl.npuir_add",
+      "tl.npuir_mul",  "tl.npuir_sub",  "tl.npuir_div",   "tl.npuir_sigmoid",
+      "tl.npuir_ln",   "tl.npuir_sqrt", "tl.npuir_rsqrt", "tl.npuir_min",
+      "tl.npuir_max",  "tl.npuir_brc",  "tl.npuir_cmp",   "tl.npuir_select",
+      "tl.npuir_cast",
   };
 
   bool IsScalar(const PrimExpr &expr) {
@@ -957,11 +1343,8 @@ private:
     return Call(DataType::Handle(), region_op, args);
   }
 
-  /**
-   * Find the index of the offset containing the loop variable.
-   * Returns -1 if not found, -2 if found in multiple offsets or indirect mem
-   * access.
-   */
+  // Find which offset directly carries the loop var.
+  // Return -1 if not found, or -2 if it appears indirectly or multiple times.
   int FindLoopVarInOffsets(const std::vector<PrimExpr> &offsets,
                            const VarNode *loop_var) {
     int found_dim = -1;
@@ -972,10 +1355,10 @@ private:
       class LoopVarVisitor : public ExprVisitor {
       public:
         const VarNode *target_var;
-        bool found = false;   // Whether appeared directly
-        bool &indirect_found; // Whether appeared indirectly
+        bool found = false;   // Found by direct use in the current offset
+        bool &indirect_found; // Found under a nested BufferLoad
         bool indirect_scope =
-            false; // Status flag: whether the visitor is in a BufferLoad
+            false; // Track whether the current walk is inside a BufferLoad
 
         LoopVarVisitor(const VarNode *var, bool &indirect_flag)
             : target_var(var), indirect_found(indirect_flag) {}
@@ -992,13 +1375,13 @@ private:
         }
 
         void VisitExpr_(const BufferLoadNode *op) override {
-          // Visit a BufferLoad, set the status flag - indirect_scope
+          // Enter BufferLoad scope so loop-var uses below it count as indirect
           bool saved_scope = indirect_scope;
           indirect_scope = true;
           for (const auto &index : op->indices) {
             VisitExpr(index);
           }
-          // Reset the status flag
+          // Restore the previous scope after visiting the load indices
           indirect_scope = saved_scope;
         }
       } visitor(loop_var, indirect_found);
@@ -1287,11 +1670,8 @@ using namespace tir::transform;
 tvm::transform::Pass NpuLoopVectorize() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
     auto *new_pf = f.CopyOnWrite();
-    LOG(INFO) << new_pf->body;
     new_pf->body = LoopDecompose()(std::move(new_pf->body));
-    LOG(INFO) << new_pf->body;
     new_pf->body = LoopVectorize()(std::move(new_pf->body));
-    LOG(INFO) << new_pf->body;
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.NpuLoopVectorize", {});

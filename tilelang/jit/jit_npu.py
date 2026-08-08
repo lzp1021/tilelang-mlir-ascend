@@ -21,8 +21,42 @@ from ..utils import (
 
 from tvm import tir
 from tvm.tir import PrimFunc
+from tvm import transform
 
 from tilelang.profiler import Profiler, TensorSupplyType
+from tilelang.transform.pass_config import normalize_pass_configs
+
+
+_ARCH_CACHE = None
+
+
+def _is_a5_device():
+    global _ARCH_CACHE
+    if _ARCH_CACHE is None:
+        _ARCH_CACHE = NPUUtils().get_arch()
+    return "910_95" in _ARCH_CACHE or "950" in _ARCH_CACHE
+
+
+def _normalize_out_idx(out_idx, total_params):
+    if out_idx is None:
+        return None
+    if isinstance(out_idx, int):
+        out_idx = [out_idx]
+    elif isinstance(out_idx, (list, tuple)):
+        out_idx = list(out_idx)
+    else:
+        raise TypeError(
+            f"out_idx must be int, list, or tuple; got {type(out_idx).__name__}"
+        )
+    normalized = []
+    for i in out_idx:
+        idx = i if i >= 0 else total_params + i
+        if idx < 0 or idx >= total_params:
+            raise ValueError(
+                f"out_idx {i} is out of bounds for kernel with {total_params} parameters"
+            )
+        normalized.append(idx)
+    return normalized
 
 
 class LaunchThreadExtractor:
@@ -49,7 +83,7 @@ class LaunchThreadExtractor:
     def extract(self, node: PrimFunc, thread: str):
         self.thread = thread
         self.visit_thread_extent(node)
-        if self.expressions is None:
+        if not self.expressions:
             return None
         return self.expressions[0]
 
@@ -108,18 +142,204 @@ def _transform_stmt(stmt, symbolic_var_names):
         return stmt
 
 
-# Collect all variables used in the buffer shape
+def _collect_tir_vars(expr):
+    """Collect all tir.Var nodes from a TIR expression, preserving first-seen order."""
+    vars_found = []
+    seen = set()
+
+    def visit(node):
+        if isinstance(node, tir.Var):
+            key = node.name
+            if key not in seen:
+                seen.add(key)
+                vars_found.append(node)
+
+    tir.stmt_functor.post_order_visit(expr, visit)
+    return vars_found
+
+
+def _detect_affine(expr, var):
+    """Detect if expr is affine in *var*: expr = a * var + b.
+
+    Returns (a, b) as Python ints, or None if not affine in *var*.
+    """
+    if isinstance(expr, tir.Var):
+        if expr.same_as(var) or expr.name == var.name:
+            return (1, 0)
+        return None
+
+    if isinstance(expr, tir.IntImm):
+        return (0, int(expr))
+
+    if isinstance(expr, tir.Add):
+        left = _detect_affine(expr.a, var)
+        right = _detect_affine(expr.b, var)
+        if left is not None and right is not None:
+            return (left[0] + right[0], left[1] + right[1])
+        return None
+
+    if isinstance(expr, tir.Sub):
+        left = _detect_affine(expr.a, var)
+        right = _detect_affine(expr.b, var)
+        if left is not None and right is not None:
+            return (left[0] - right[0], left[1] - right[1])
+        return None
+
+    if isinstance(expr, tir.Mul):
+        left = _detect_affine(expr.a, var)
+        right = _detect_affine(expr.b, var)
+        if left is not None and right is not None:
+            if left[0] == 0:
+                scale = left[1]
+                return (right[0] * scale, right[1] * scale)
+            if right[0] == 0:
+                scale = right[1]
+                return (left[0] * scale, left[1] * scale)
+            return None
+        return None
+
+    if isinstance(expr, tir.FloorDiv):
+        left = _detect_affine(expr.a, var)
+        if left is not None and isinstance(expr.b, tir.IntImm):
+            divisor = int(expr.b)
+            if left[0] == 0:
+                return (0, left[1] // divisor)
+        return None
+
+    return None
+
+
+def _eval_tir_expr(expr, dynamic_val):
+    """Evaluate a TIR PrimExpr at runtime using resolved dynamic values.
+
+    *dynamic_val* maps var-name (str) -> int.
+    """
+    if isinstance(expr, tir.Var):
+        val = dynamic_val.get(str(expr))
+        if val is None:
+            raise ValueError(
+                f"Missing runtime value for symbolic var '{expr}' in shape expression"
+            )
+        return val
+
+    if isinstance(expr, tir.IntImm):
+        return int(expr)
+
+    if isinstance(expr, tir.Add):
+        return _eval_tir_expr(expr.a, dynamic_val) + _eval_tir_expr(expr.b, dynamic_val)
+
+    if isinstance(expr, tir.Sub):
+        return _eval_tir_expr(expr.a, dynamic_val) - _eval_tir_expr(expr.b, dynamic_val)
+
+    if isinstance(expr, tir.Mul):
+        return _eval_tir_expr(expr.a, dynamic_val) * _eval_tir_expr(expr.b, dynamic_val)
+
+    if isinstance(expr, tir.FloorDiv):
+        return _eval_tir_expr(expr.a, dynamic_val) // _eval_tir_expr(
+            expr.b, dynamic_val
+        )
+
+    if isinstance(expr, tir.Div):
+        return _eval_tir_expr(expr.a, dynamic_val) // _eval_tir_expr(
+            expr.b, dynamic_val
+        )
+
+    if isinstance(expr, tir.Mod):
+        return _eval_tir_expr(expr.a, dynamic_val) % _eval_tir_expr(expr.b, dynamic_val)
+
+    if isinstance(expr, tir.Max):
+        return max(
+            _eval_tir_expr(expr.a, dynamic_val), _eval_tir_expr(expr.b, dynamic_val)
+        )
+
+    if isinstance(expr, tir.Min):
+        return min(
+            _eval_tir_expr(expr.a, dynamic_val), _eval_tir_expr(expr.b, dynamic_val)
+        )
+
+    from tvm import arith
+
+    vars_found = _collect_tir_vars(expr)
+    vmap = {}
+    for v in vars_found:
+        val = dynamic_val.get(v.name)
+        if val is None:
+            raise ValueError(
+                f"Missing runtime value for symbolic var '{v.name}' in shape expression"
+            )
+        vmap[v] = tir.IntImm(v.dtype, val)
+
+    substituted = tir.stmt_functor.substitute(expr, vmap)
+    simplified = arith.Analyzer().simplify(substituted)
+    if isinstance(simplified, tir.IntImm):
+        return int(simplified.value)
+    else:
+        raise ValueError(
+            f"Cannot simplify shape expression '{expr}' to a constant integer, got '{simplified}'"
+        )
+
+
+# Collect all variables used in the buffer shape, including vars nested
+# inside composite TIR expressions such as tir.Add(var, 1).
 def _process_dynamic_symbolic(func):
     params = func.params
     buffer_map = func.buffer_map
     dynamic_symbolic_map = {}
-    for i, param in enumerate(params):
+
+    # Phase 1: collect every tir.Var that appears in any buffer shape,
+    # including those nested inside composite expressions (Add, Sub, Mul, ...).
+    all_vars = []
+    seen_var_names = set()
+    for param in params:
         if param not in buffer_map:
             continue
         buffer = buffer_map[param]
-        for j, shape in enumerate(buffer.shape):
-            if isinstance(shape, tir.Var) and (shape not in dynamic_symbolic_map):
-                dynamic_symbolic_map[shape] = (i, j)
+        for shape in buffer.shape:
+            for v in _collect_tir_vars(shape):
+                if v.name not in seen_var_names:
+                    seen_var_names.add(v.name)
+                    all_vars.append(v)
+
+    # Phase 2: for each var, find the best binding.
+    #   - Preferred: a buffer dim whose shape IS the var (direct binding).
+    #   - Fallback: a buffer dim whose shape is an affine expression in var
+    #     (composite binding with inverse transform).
+    for var in all_vars:
+        # Skip vars that are already explicit parameters (scalar params).
+        if var in params:
+            continue
+
+        # Try direct binding first.
+        for i, param in enumerate(params):
+            if param not in buffer_map:
+                continue
+            buffer = buffer_map[param]
+            for j, shape in enumerate(buffer.shape):
+                if isinstance(shape, tir.Var) and shape.same_as(var):
+                    dynamic_symbolic_map[var] = (i, j)
+                    break
+            if var in dynamic_symbolic_map:
+                break
+
+        if var in dynamic_symbolic_map:
+            continue
+
+        # Fall back to affine binding.
+        for i, param in enumerate(params):
+            if param not in buffer_map:
+                continue
+            buffer = buffer_map[param]
+            for j, shape in enumerate(buffer.shape):
+                if isinstance(shape, tir.Var):
+                    continue
+                affine = _detect_affine(shape, var)
+                if affine is not None and affine[0] != 0:
+                    a, b = affine
+                    dynamic_symbolic_map[var] = (i, j, a, b)
+                    break
+            if var in dynamic_symbolic_map:
+                break
+
     return dynamic_symbolic_map
 
 
@@ -251,7 +471,17 @@ def extract_device_print_code_from_cann():
 
 
 def generate_npu_wrapper_src(
-    constants, signature, workspace_size, mix_mode, lock_num, lock_ini_val, need_debug
+    constants,
+    signature,
+    workspace_size,
+    mix_mode,
+    lock_num,
+    lock_ini_val,
+    need_debug,
+    force_simt_only=False,
+    shared_mem_dynamic_size=0,
+    compile_on_910_95=False,
+    target_support_ffts=True,
 ):
     def _ty_to_cpp(ty):
         if ty[0] == "*":
@@ -520,7 +750,12 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   // base_ptr offset shape and stride are not used, arbitrarily set for now
   std::string name = "";
   name.append(kernelName);
-  {"auto launch_call = [=]()" if enable_taskqueue else ""} {{
+  void *workspace_addr = NULL;
+  {
+        "auto launch_call = [=]() mutable -> rtError_t"
+        if (enable_taskqueue and compile_on_910_95)
+        else ("auto launch_call = [&]()" if enable_taskqueue else "")
+    } {{
     uint32_t blockNum = gridX * gridY * gridZ;
     {
         "blockNum = std::min(blockNum, (uint32_t)" + str(num_physical_blocks) + ");"
@@ -533,14 +768,19 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
         else ""
     }
     rtError_t ret;
+    void *syncBlockLock = NULL;
+    {
+        f'''
     void *ffts_addr = NULL;
     uint32_t ffts_len; ret = rtGetC2cCtrlAddr((uint64_t*)&ffts_addr, &ffts_len);
     if (ret != RT_ERROR_NONE) {{
-      return {"ret" if enable_taskqueue else ""};
+      return {'ret' if enable_taskqueue else ''};
     }}
-    // stub argument for workspace
-    void *syncBlockLock = NULL;
-    void *workspace_addr = NULL;
+    '''
+        if target_support_ffts
+        else ""
+    }
+
     uint16_t ModuleId = 0;
     {
         f'''
@@ -573,9 +813,17 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
         else ""
     }
     struct __attribute__((packed)) {{
-      void* ffts_addr __attribute__((aligned(8)));
-      void* syncBlockLock __attribute__((aligned(8)));
-      void* workspace_addr __attribute__((aligned(8)));
+      {"void* ffts_addr __attribute__((aligned(8)));" if target_support_ffts else ""}
+      {
+        "void* syncBlockLock __attribute__((aligned(8)));"
+        if not force_simt_only
+        else ""
+    }
+      {
+        "void* workspace_addr __attribute__((aligned(8)));"
+        if not force_simt_only
+        else ""
+    }
       {
         " ".join(
             f"{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != '*' and ty[-2:] != '64' else 8})));"
@@ -591,9 +839,17 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     }
       {"void* DTData __attribute__((aligned(8)));" if need_debug else ""}
     }} args = {{
-      static_cast<void*>(ffts_addr),
-      static_cast<void*>(syncBlockLock),
-      static_cast<void*>(workspace_addr),
+      {"static_cast<void*>(ffts_addr)," if target_support_ffts else ""}
+      {
+        ("static_cast<void*>(syncBlockLock)," if lock_num > 0 else "nullptr,")
+        if not force_simt_only
+        else ""
+    }
+      {
+        ("static_cast<void*>(workspace_addr)," if workspace_size > 0 else "nullptr,")
+        if not force_simt_only
+        else ""
+    }
       {
         ", ".join(
             f"static_cast<{_ty_to_cpp(ty)}>(arg{i})"
@@ -610,16 +866,35 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
       {", static_cast<void*>(DTData)" if need_debug else ""}
     }};
     {cpp_msprof_call_before_launch}
-    ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);
+    {
+        f'''
+    rtArgsEx_t argsInfo = {{}};
+    argsInfo.args = static_cast<void*>(&args);
+    argsInfo.argsSize = sizeof(args);
+    rtTaskCfgInfo_t cfgInfo = {{}};
+    cfgInfo.localMemorySize = {shared_mem_dynamic_size};
+    ret = rtKernelLaunchWithFlagV2(func, blockNum, &argsInfo, NULL, stream, 0, &cfgInfo);
+    '''
+        if compile_on_910_95
+        else "ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);"
+    }
     {"void *&stream_ref = const_cast<void*&>(stream);" if need_debug else ""}
     {"cce::internal::DebugTunnel::Close(DTData, stream_ref);" if need_debug else ""}
     {cpp_msprof_call_after_launch}
-    {"return ret;" if enable_taskqueue else ""}
+    {
+        "return ret;"
+        if enable_taskqueue
+        else ("ret = rtStreamSynchronize(stream);" if compile_on_910_95 else "")
+    }
    }};
    {
-        "at_npu::native::OpCommand::RunOpApi(name.c_str(), launch_call);"
-        if enable_taskqueue
-        else ""
+        "at_npu::native::OpCommand cmd; cmd.Name(name.c_str()).SetCustomHandler(launch_call).Run();"
+        if (enable_taskqueue and compile_on_910_95)
+        else (
+            "at_npu::native::OpCommand::RunOpApi(name.c_str(), launch_call, true); rtFree(workspace_addr);"
+            if enable_taskqueue
+            else ""
+        )
     }
   return;
 }}
@@ -809,7 +1084,6 @@ class JitKernel_NPU:
     def __init__(self, metadata: dict, out_idx=None) -> None:
         self.params = metadata["params"]
         self.signature = metadata.get("signature", {})
-        self.out_idx = out_idx
         self.param_info = metadata.get("param_info", [])
         # 1 launch path
         self.so_launcher_path = metadata.get(
@@ -840,8 +1114,22 @@ class JitKernel_NPU:
         self.gridfunc = metadata["gridfunc"]
         self.symbolic = metadata["symbolic"]
         self.prim_func = metadata["primfunc"]
-        self.out_idx = metadata["out_idx"]
+        self.out_idx = _normalize_out_idx(
+            out_idx if out_idx is not None else metadata["out_idx"], len(self.params)
+        )
         self._launch()
+        (
+            self.npu_module,
+            self.npu_function,
+            self.npu_n_regs,
+            self.npu_n_spills,
+        ) = NPUUtils.get().load_binary(
+            self.utils_name,
+            self.utils_kernel_src,
+            self.utils_shared,
+            self.utils_device,
+            self.mix_mode,
+        )
 
     @classmethod
     def from_database(
@@ -853,9 +1141,7 @@ class JitKernel_NPU:
         metadata: str,
         out_idx: Union[List[int], int],
     ):
-        if isinstance(out_idx, int):
-            out_idx = [out_idx]
-
+        metadata["so_launcher_path"] = kernel_launcher_path
         instance = cls(metadata)
         instance.so_launcher_path = kernel_launcher_path
         instance.so_utils_path = kernel_utils_path
@@ -885,14 +1171,21 @@ class JitKernel_NPU:
         dynamic_val = {}
         extra_args = []
         for key, pos in self.symbolic.items():
-            # Ensure that pos is a tuple with two elements.
+            # pos is (buffer_idx, dim_idx) for direct binding,
+            # or (buffer_idx, dim_idx, a, b) for affine binding where
+            # var = (actual_dim - b) // a.
             if isinstance(pos, (tuple, list)) and len(pos) >= 2:
                 tensor_idx, dim_idx = pos[0], pos[1]
                 if tensor_idx in orig_to_input:
-                    pos = orig_to_input[tensor_idx]
-                    arg = args[pos]
+                    arg_pos = orig_to_input[tensor_idx]
+                    arg = args[arg_pos]
                     if isinstance(arg, torch.Tensor) and dim_idx < len(arg.shape):
-                        value = arg.shape[dim_idx]
+                        actual_dim = arg.shape[dim_idx]
+                        if len(pos) == 4:
+                            a, b = pos[2], pos[3]
+                            value = (actual_dim - b) // a
+                        else:
+                            value = actual_dim
                         dynamic_val[str(key)] = value
                         extra_args.append(value)
                     else:
@@ -966,6 +1259,11 @@ class JitKernel_NPU:
                         if val is None:
                             raise ValueError(f"Missing value for {dim}")
                         shape.append(val)
+                    elif isinstance(dim, tir.IntImm):
+                        shape.append(int(dim))
+                    elif isinstance(dim, tir.PrimExpr):
+                        val = _eval_tir_expr(dim, dynamic_val)
+                        shape.append(val)
                     else:
                         shape.append(int(dim))
 
@@ -981,20 +1279,12 @@ class JitKernel_NPU:
         full_args.extend(self.extra_args)
 
         # Run kernel
-        npu_utils = NPUUtils.get()
-        t_module, t_function, t_n_regs, t_n_spills = npu_utils.load_binary(
-            self.utils_name,
-            self.utils_kernel_src,
-            self.utils_shared,
-            self.utils_device,
-            self.mix_mode,
-        )
         self.launch_npu(
             self.launch_grid[0],
             self.launch_grid[1],
             self.launch_grid[2],
             self.launch_stream,
-            t_function,
+            self.npu_function,
             self.launch_packedMetadata,
             self.launch_metadata,
             self.launch_enter_hook,
@@ -1143,14 +1433,14 @@ class compiler_npu:
                 continue
         return default
 
-    def compile(self, mod: PrimFunc, out_idx=None) -> JitKernel_NPU:
+    def compile(
+        self, mod: PrimFunc, out_idx=None, pass_configs: dict[str, Any] = None
+    ) -> JitKernel_NPU:
         self.original_mod = mod
         # extract_param_info
         param_info = self._extract_param_info(mod, out_idx)
-        # process negative out_idx
-        if out_idx is not None:
-            total_params = len(param_info)
-            out_idx = [i if i >= 0 else total_params + i for i in out_idx]
+        # Normalise out_idx to canonical (non-negative, list) form
+        out_idx = _normalize_out_idx(out_idx, len(param_info))
         self.metadata = {}
         self.metadata["out_idx"] = out_idx
         self.metadata["param_info"] = param_info
@@ -1162,7 +1452,13 @@ class compiler_npu:
         self.out_idx = out_idx
         self.metadata["out_idx"] = self.out_idx
 
-        mlir_path = lower(self.mod)
+        # Apply pass_configs using TVM PassContext
+        if pass_configs is None:
+            pass_configs = {}
+        # Store pass_configs for later use in NPU compilation
+        self.pass_configs = normalize_pass_configs(pass_configs)
+        with transform.PassContext(opt_level=3, config=pass_configs):
+            mlir_path = lower(self.mod)
         if mlir_path.endswith(".mlir"):
             self.mlir_content = self._read_mlir_file(mlir_path)
         else:
@@ -1180,6 +1476,10 @@ class compiler_npu:
         self._parse_npuir_metadata()
         self.metadata["kernel_src"] = self._npuir_to_bin_enable_npu_compile()
         self.header_path = get_npu_launcher_header()
+        is_a5 = _is_a5_device()
+        shared_mem_dynamic_size = self.metadata.get(
+            "shared_mem_dynamic_size", 221184 if is_a5 else 0
+        )
         self.wrapper_src = generate_npu_wrapper_src(
             self.constants,
             self.signature,
@@ -1188,6 +1488,10 @@ class compiler_npu:
             self.lock_num,
             self.lock_ini_val,
             self.need_debug,
+            self.metadata.get("force_simt_only", False),
+            shared_mem_dynamic_size,
+            is_a5,
+            not is_a5,
         )
         self.so_launcher_path = self.make_npu_launcher_stub(
             self.metadata["kernel_name"], self.header_path, self.wrapper_src
@@ -1275,6 +1579,8 @@ class compiler_npu:
         mapping = {
             "float16": torch.float16,
             "float32": torch.float32,
+            "float64": torch.float64,
+            "bfloat16": torch.bfloat16,
             "int8": torch.int8,
             "int16": torch.int16,
             "int32": torch.int32,
@@ -1284,9 +1590,9 @@ class compiler_npu:
         return mapping.get(dtype_str, torch.float32)
 
     def _parse_grid(self):
-        launcher = LaunchThreadExtractor()
-        expr = launcher.extract(self.mod, "blockIdx.x")
-        self.metadata["gridfunc"] = str(expr)
+        launcher_x = LaunchThreadExtractor()
+        expr_x = launcher_x.extract(self.mod, "blockIdx.x")
+        self.metadata["gridfunc"] = str(expr_x)
 
     def _read_mlir_file(self, file_path) -> str:
         """
@@ -1395,8 +1701,12 @@ class compiler_npu:
         result = {}
         index = 0
 
-        # Skip parameters insert by compiler
-        for param in params[3:-6]:
+        # Skip parameters inserted by compiler:
+        # A5 (910_95/950): 2 params (syncBlockLock, workspace) - ffts_addr not supported
+        # Others: 3 params (ffts_addr, syncBlockLock, workspace)
+        is_a5 = _is_a5_device()
+        compiler_inserted_params = 2 if is_a5 else 3
+        for param in params[compiler_inserted_params:-6]:
             # Check if the type includes the target type
             found_type = None
             for t_type in target_types:
@@ -1439,11 +1749,42 @@ class compiler_npu:
             npu_compiler_path = get_npucompiler_path()
             # TileLang Ascend JIT Runtime now follows Triton JIT style.
             # bishengir-compile --enable-triton-kernel-compile=true make sure the way.
-            _compile_option_list = [
-                "--enable-auto-multi-buffer=true",
-                "--enable-triton-kernel-compile=true",
-                "--enable-hivm-compile=true",
-            ]
+
+            _compile_option_list = []
+            pass_configs = getattr(self, "pass_configs", {})
+
+            if _is_a5_device():
+                # === A5 compile options ===
+                env_arch = os.getenv("TRITON_ASCEND_ARCH", "")
+                target_arch = env_arch if env_arch else _ARCH_CACHE
+                _compile_option_list = [
+                    f"--target={target_arch}",
+                    "--enable-auto-multi-buffer=true",
+                    "--disable-ffts",
+                    "--enable-triton-kernel-compile=true",
+                    "--enable-hivm-compile=true",
+                    "--enable-vf-merge-level=1",
+                    "--enable-hfusion-compile=true",
+                    "--enable-auto-bind-sub-block=true",
+                ]
+            else:
+                # === Non-A5 compile options ===
+                enable_auto_multi_buffer = pass_configs.get(
+                    "npuir.enable_auto_multi_buffer",
+                    True,
+                )
+                _compile_option_list.append(
+                    f"--enable-auto-multi-buffer={str(enable_auto_multi_buffer).lower()}"
+                )
+                disable_hivm_auto_inject_sync = pass_configs.get(
+                    "npuir.disable_hivm_auto_inject_sync",
+                    False,
+                )
+                _compile_option_list.append(
+                    f"--disable-hivm-auto-inject-sync={str(disable_hivm_auto_inject_sync).lower()}"
+                )
+                _compile_option_list.append("--enable-triton-kernel-compile=true")
+                _compile_option_list.append("--enable-hivm-compile=true")
 
             TILELANG_ASCEND_MODE = os.environ.get("TILELANG_ASCEND_MODE")
             if TILELANG_ASCEND_MODE is None or TILELANG_ASCEND_MODE.lower().strip() in [

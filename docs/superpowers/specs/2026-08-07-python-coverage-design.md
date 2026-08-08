@@ -15,7 +15,7 @@ Coverage policy and execution are separated:
 - `.coveragerc` is the single source of truth for measured source, branch coverage, omitted paths, and report formatting.
 - `scripts/run_python_coverage.py` is the shared local/CI entry point. It constructs a deterministic pytest command, creates the report directory, forwards caller arguments to pytest, and returns pytest's exit code unchanged.
 - `requirements-test.txt` declares `pytest-cov` as a test dependency.
-- `.github/workflows/ci_npuir.yml` invokes the shared script and uploads reports even when tests fail.
+- `.github/workflows/test_npuir_wheel.yml` invokes the shared script and uploads reports even when tests fail.
 
 This avoids duplicating a long pytest command in CI while preserving the repository's existing `--op`, `--mode`, and `--npu-device` selection contract.
 

@@ -2010,7 +2010,23 @@ mlir::Value CodeGenTileLangNPUIRDEV::BinaryOpCodegen(const PrimExprNode *op,
   // duplicated MLIR Op
   std::pair<bool, mlir::Value> result = CheckPrimExprMap(op);
   if (result.first) {
-    return result.second;
+    mlir::Value cached = result.second;
+
+    // Only reuse a cached binary op when it was generated from the current
+    // operands. The same PrimExprNode can be revisited with remapped SSA values
+    // while lowering loops, so blindly returning the cached value may reuse an
+    // operation from an earlier operand context.
+    if (auto *defOp = cached.getDefiningOp()) {
+      bool operandsMatch = false;
+      if (defOp->getNumOperands() >= 2) {
+        operandsMatch =
+            (defOp->getOperand(0) == lhs && defOp->getOperand(1) == rhs);
+      }
+
+      if (operandsMatch) {
+        return cached;
+      }
+    }
   }
   mlir::Value mlirVal;
   if constexpr (std::is_same_v<U, std::nullptr_t>) {
@@ -3724,6 +3740,22 @@ void CodeGenTileLangNPUIRDEV::VisitStmt_(const AttrStmtNode *op) {
       mlir::Value indexOp = GetAndCastIndexOp<mlir::hivm::GetBlockIdxOp>(iv);
       SetVarValue(iv->var.get(), indexOp);
     } else if (iv->thread_tag == "blockIdx.y" && iv->var->name_hint != "_") {
+      auto extent_y = iv->dom->extent;
+      mlir::Value upperBound = MakeValue(extent_y);
+      mlir::Type indexType = upperBound.getType();
+      mlir::Location loc = mlir::UnknownLoc::get(&context);
+      auto lowerBound = builder.create<mlir::arith::ConstantOp>(
+          loc, indexType, builder.getIntegerAttr(indexType, 0));
+      auto step = builder.create<mlir::arith::ConstantOp>(
+          loc, indexType, builder.getIntegerAttr(indexType, 1));
+      auto forOp =
+          builder.create<mlir::scf::ForOp>(loc, lowerBound, upperBound, step);
+      mlir::OpBuilder::InsertionGuard insertGuard(builder);
+      builder.setInsertionPointToStart(forOp.getBody());
+      SetVarValue(iv->var.get(), forOp.getInductionVar());
+      this->VisitStmt(op->body);
+      return;
+    } else if (iv->thread_tag == "blockIdx.z" && iv->var->name_hint != "_") {
       mlir::Value indexOp = GetAndCastIndexOp<mlir::hivm::GetSubBlockIdxOp>(iv);
       SetVarValue(iv->var.get(), indexOp);
     }
@@ -4410,7 +4442,7 @@ void CodeGenTileLangNPUIRDEV::LoopCarriedVarCollector::VisitExpr_(
     CheckVar(npuirop.src->data.get());
     CheckVar(npuirop.dst->data.get());
   } else if (call->op.same_as(Op::Get("tl.npuir_rsqrt"))) {
-    tvm::tl::NpuirSqrt npuirop(call->args, outer_->vmap);
+    tvm::tl::NpuirRsqrt npuirop(call->args, outer_->vmap);
     CheckVar(npuirop.src->data.get());
     CheckVar(npuirop.dst->data.get());
   } else if (call->op.same_as(Op::Get("tl.npuir_rec"))) {
