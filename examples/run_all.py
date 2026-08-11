@@ -95,15 +95,34 @@ def collect_examples(base_dir: Path):
     return examples
 
 
-def run_example(rel_path: str, base_dir: Path, device_id: int, timeout: int = 300):
+def run_example(
+    rel_path: str,
+    base_dir: Path,
+    device_id: int,
+    timeout: int = 300,
+    coverage: bool = False,
+):
     abs_path = base_dir / rel_path
     env = os.environ.copy()
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(device_id)
+    command = [sys.executable, str(abs_path)]
+    if coverage:
+        repo_root = base_dir.parent
+        env["COVERAGE_FILE"] = str(repo_root / ".coverage")
+        command = [
+            sys.executable,
+            "-m",
+            "coverage",
+            "run",
+            "--parallel-mode",
+            f"--rcfile={repo_root / '.coveragerc'}",
+            str(abs_path),
+        ]
 
     start = time.time()
     try:
         proc = subprocess.run(
-            [sys.executable, str(abs_path)],
+            command,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -209,6 +228,11 @@ def main():
         action="store_true",
         help="Run sequentially on NPU0 (for debugging)",
     )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Collect parallel Python coverage from each example process",
+    )
     args = parser.parse_args()
 
     num_devices = get_npu_device_count()
@@ -248,7 +272,13 @@ def main():
                 _flush_ordered(results, width)
             return
 
-        result = run_example(rel_path, EXAMPLES_DIR, device_id, timeout=args.timeout)
+        result = run_example(
+            rel_path,
+            EXAMPLES_DIR,
+            device_id,
+            timeout=args.timeout,
+            coverage=args.coverage,
+        )
         results[idx] = result
 
         with print_lock:

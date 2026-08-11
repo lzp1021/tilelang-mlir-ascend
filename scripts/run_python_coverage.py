@@ -24,6 +24,7 @@ def build_pytest_command(repo_root: Path, pytest_args: Sequence[str]) -> list[st
         *discover_test_paths(repo_root),
         "--cov=tilelang",
         "--cov-config=.coveragerc",
+        "--cov-append",
         "--cov-report=term-missing",
         "--cov-report=html:coverage/python-html",
         "--cov-report=xml:coverage/python.xml",
@@ -43,11 +44,27 @@ def run_command(command: Sequence[str], cwd: Path) -> int:
     return subprocess.run(list(command), cwd=cwd, check=False).returncode
 
 
+def run_coverage_pipeline(repo_root: Path, pytest_args: Sequence[str]) -> int:
+    commands = [
+        [sys.executable, "-m", "coverage", "erase"],
+        [
+            sys.executable,
+            "examples/run_all.py",
+            "--sequential",
+            "--coverage",
+        ],
+        [sys.executable, "-m", "coverage", "combine"],
+        build_pytest_command(repo_root, pytest_args),
+    ]
+    return_codes = [run_command(command, repo_root) for command in commands]
+    return next((code for code in return_codes if code != 0), 0)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parents[1]
     prepare_output_directories(repo_root)
-    command = build_pytest_command(repo_root, sys.argv[1:] if argv is None else argv)
-    return run_command(command, repo_root)
+    pytest_args = sys.argv[1:] if argv is None else argv
+    return run_coverage_pipeline(repo_root, pytest_args)
 
 
 if __name__ == "__main__":

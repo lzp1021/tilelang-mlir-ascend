@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.run_python_coverage as coverage_runner
 from scripts.run_python_coverage import (
     build_pytest_command,
     discover_test_paths,
@@ -46,6 +47,7 @@ def test_build_pytest_command_adds_reports_and_preserves_arguments(tmp_path: Pat
         "testing/npuir/memory_ops",
         "--cov=tilelang",
         "--cov-config=.coveragerc",
+        "--cov-append",
         "--cov-report=term-missing",
         "--cov-report=html:coverage/python-html",
         "--cov-report=xml:coverage/python.xml",
@@ -70,6 +72,48 @@ def test_prepare_output_directories_creates_report_parents(tmp_path: Path):
 
     assert (tmp_path / "coverage").is_dir()
     assert (tmp_path / "testing" / "npuir" / "output").is_dir()
+
+
+def test_coverage_pipeline_combines_examples_before_appending_pytest_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / "testing" / "npuir" / "memory_ops").mkdir(parents=True)
+    commands = []
+
+    def record_command(command, cwd):
+        assert cwd == tmp_path
+        commands.append(list(command))
+        return 0
+
+    monkeypatch.setattr(coverage_runner, "run_command", record_command)
+
+    assert coverage_runner.run_coverage_pipeline(tmp_path, ["-v"]) == 0
+    assert commands == [
+        [sys.executable, "-m", "coverage", "erase"],
+        [
+            sys.executable,
+            "examples/run_all.py",
+            "--sequential",
+            "--coverage",
+        ],
+        [sys.executable, "-m", "coverage", "combine"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "testing/npuir/memory_ops",
+            "--cov=tilelang",
+            "--cov-config=.coveragerc",
+            "--cov-append",
+            "--cov-report=term-missing",
+            "--cov-report=html:coverage/python-html",
+            "--cov-report=xml:coverage/python.xml",
+            "--html=testing/npuir/output/report.html",
+            "--self-contained-html",
+            "--junitxml=coverage/junit.xml",
+            "-v",
+        ],
+    ]
 
 
 def test_coverage_policy_measures_tilelang_branches_and_shows_missing_lines():
@@ -102,6 +146,7 @@ def test_npuir_workflow_runs_shared_coverage_command_and_uploads_reports():
 
     assert "uv pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
     assert "python scripts/run_python_coverage.py -v -n 2" in workflow
+    assert "python examples/run_all.py" not in workflow
     assert "path: |\n          testing/npuir/output/\n          coverage/" in workflow
 
 

@@ -150,6 +150,10 @@ python -m pip install -r requirements-test.txt
 python scripts/run_python_coverage.py
 ```
 
+The shared runner first executes every Python operator selected by
+`examples/run_all.py`, then runs every `testing/npuir/*_ops` pytest case. Coverage
+from the example subprocesses and pytest workers is combined into one report.
+
 The runner accepts the same pytest and NPUIR selection arguments as the direct
 pytest command:
 
@@ -164,9 +168,9 @@ The command writes these reports:
 - Cobertura coverage XML: `coverage/python.xml`
 - JUnit XML: `coverage/junit.xml`
 
-Coverage measures host Python code under `tilelang/`. It does not measure C++
-or MLIR implementation lines, nor instructions executed by generated NPU
-kernels.
+Coverage measures host Python code under `tilelang/` reached by both examples
+and NPUIR tests. It does not measure C++ or MLIR implementation lines, nor
+instructions executed by generated NPU kernels.
 
 ## How Filtering Works
 
