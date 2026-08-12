@@ -96,6 +96,7 @@ def test_coverage_pipeline_combines_examples_before_appending_pytest_data(
             "--sequential",
             "--coverage",
         ],
+        [sys.executable, "scripts/run_autotune_coverage.py"],
         [sys.executable, "-m", "coverage", "combine"],
         [
             sys.executable,
@@ -147,6 +148,7 @@ def test_npuir_workflow_runs_shared_coverage_command_and_uploads_reports():
     assert "uv pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
     assert "python scripts/run_python_coverage.py -v -n 2" in workflow
     assert "python examples/run_all.py" not in workflow
+    assert "timeout-minutes: 360" in workflow
     assert "path: |\n          testing/npuir/output/\n          coverage/" in workflow
 
 
@@ -157,3 +159,4 @@ def test_npuir_readme_documents_coverage_runner_and_outputs():
     assert "testing/npuir/output/report.html" in readme
     assert "coverage/python-html/index.html" in readme
     assert "coverage/python.xml" in readme
+    assert "testing/autotune/**/*.py" in readme

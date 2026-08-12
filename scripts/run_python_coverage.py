@@ -53,6 +53,7 @@ def run_coverage_pipeline(repo_root: Path, pytest_args: Sequence[str]) -> int:
             "--sequential",
             "--coverage",
         ],
+        [sys.executable, "scripts/run_autotune_coverage.py"],
         [sys.executable, "-m", "coverage", "combine"],
         build_pytest_command(repo_root, pytest_args),
     ]
