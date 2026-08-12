@@ -13,6 +13,9 @@ from scripts.run_autotune_coverage import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def test_discover_autotune_paths_returns_every_nested_python_script(tmp_path: Path):
     autotune_root = tmp_path / "testing" / "autotune"
     (autotune_root / "anneal").mkdir(parents=True)
@@ -26,6 +29,17 @@ def test_discover_autotune_paths_returns_every_nested_python_script(tmp_path: Pa
         "testing/autotune/AscendC/kernel.py",
         "testing/autotune/anneal/search.py",
     ]
+
+
+def test_ascendc_benchmarks_do_not_require_triton():
+    benchmark_import = "from tilelang.profiler.bench import do_bench as do_bench_npu"
+    paths = sorted((REPO_ROOT / "testing" / "autotune" / "AscendC").glob("*.py"))
+
+    assert paths
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert "from triton.backends.ascend.testing import do_bench_npu" not in source
+        assert benchmark_import in source
 
 
 def test_run_target_pins_and_redirects_npu_device_zero(tmp_path: Path, monkeypatch):

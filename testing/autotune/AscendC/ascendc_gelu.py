@@ -2,7 +2,7 @@ import torch
 
 torch.npu.set_device(10)
 
-from triton.backends.ascend.testing import do_bench_npu
+from tilelang.profiler.bench import do_bench as do_bench_npu
 
 SHAPES = [
     (64,),
