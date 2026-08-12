@@ -37,7 +37,9 @@ jobs:
       uses: actions/checkout@v4
       with:
         ref: ${{ inputs.checkout-ref }}
-        fetch-depth: 1
+        # The recent-code coverage report uses git blame to exclude lines older
+        # than eight months, so it needs history beyond the checkout commit.
+        fetch-depth: 0
 
     - name: Download arm64 wheel
       uses: actions/download-artifact@v4

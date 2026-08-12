@@ -114,6 +114,7 @@ def test_coverage_pipeline_combines_examples_before_appending_pytest_data(
             "--junitxml=coverage/junit.xml",
             "-v",
         ],
+        [sys.executable, "scripts/filter_recent_coverage.py", "--months", "8"],
     ]
 
 
@@ -146,6 +147,7 @@ def test_npuir_workflow_runs_shared_coverage_command_and_uploads_reports():
     )
 
     assert "uv pip install pytest pytest-xdist pytest-html pytest-cov numpy" in workflow
+    assert "fetch-depth: 0" in workflow
     assert "python scripts/run_python_coverage.py -v -n 2" in workflow
     assert "python examples/run_all.py" not in workflow
     assert "timeout-minutes: 360" in workflow
@@ -159,4 +161,6 @@ def test_npuir_readme_documents_coverage_runner_and_outputs():
     assert "testing/npuir/output/report.html" in readme
     assert "coverage/python-html/index.html" in readme
     assert "coverage/python.xml" in readme
+    assert "coverage/python-recent.xml" in readme
+    assert "coverage/python-recent.html" in readme
     assert "testing/autotune/**/*.py" in readme

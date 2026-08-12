@@ -56,6 +56,7 @@ def run_coverage_pipeline(repo_root: Path, pytest_args: Sequence[str]) -> int:
         [sys.executable, "scripts/run_autotune_coverage.py"],
         [sys.executable, "-m", "coverage", "combine"],
         build_pytest_command(repo_root, pytest_args),
+        [sys.executable, "scripts/filter_recent_coverage.py", "--months", "8"],
     ]
     return_codes = [run_command(command, repo_root) for command in commands]
     return next((code for code in return_codes if code != 0), 0)

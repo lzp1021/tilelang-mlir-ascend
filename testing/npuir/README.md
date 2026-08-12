@@ -169,11 +169,18 @@ The command writes these reports:
 - pytest HTML: `testing/npuir/output/report.html`
 - coverage HTML: `coverage/python-html/index.html`
 - Cobertura coverage XML: `coverage/python.xml`
+- recent-code coverage HTML: `coverage/python-recent.html`
+- recent-code Cobertura XML: `coverage/python-recent.xml`
+- recent-code summary: `coverage/python-recent-summary.txt`
 - JUnit XML: `coverage/junit.xml`
 
 Coverage measures host Python code under `tilelang/` reached by examples,
 autotune scripts, and NPUIR tests. It does not measure C++ or MLIR
 implementation lines, nor instructions executed by generated NPU kernels.
+The full report is retained for auditing. The recent-code reports use
+`git blame` and include only executable lines committed on or after the date
+eight calendar months before the run date. The CI checkout therefore keeps the
+complete Git history.
 
 ## How Filtering Works
 
