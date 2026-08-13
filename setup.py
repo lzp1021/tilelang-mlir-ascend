@@ -455,6 +455,10 @@ class TileLangBuilPydCommand(build_py):
             os.path.join(ROOT_DIR, "build", "tilelangir"),
         ]
 
+        prebuilt_lib_dir = os.environ.get("TILELANG_PREBUILT_LIB_DIR")
+        if prebuilt_lib_dir:
+            potential_dirs.insert(0, os.path.abspath(prebuilt_lib_dir))
+
         tvm_prebuild_path = os.environ.get("TVM_PREBUILD_PATH")
         if tvm_prebuild_path:
             potential_dirs.insert(0, os.path.abspath(tvm_prebuild_path))

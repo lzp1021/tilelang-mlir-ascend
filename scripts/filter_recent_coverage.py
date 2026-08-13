@@ -129,9 +129,15 @@ def filter_coverage_tree(
 
 
 class GitLineDates:
-    def __init__(self, repo_root: Path, cutoff: date):
+    def __init__(
+        self,
+        repo_root: Path,
+        cutoff: date,
+        source_prefix: Optional[Path] = Path("tilelang"),
+    ):
         self.repo_root = repo_root
         self.cutoff = cutoff
+        self.source_prefix = source_prefix
         self._cache: dict[str, dict[int, date]] = {}
 
     def is_recent(self, filename: str, line_number: int) -> bool:
@@ -146,7 +152,14 @@ class GitLineDates:
             ) from exc
 
     def _load(self, filename: str) -> dict[int, date]:
-        tracked_path = Path("tilelang") / Path(filename)
+        source_path = Path(filename)
+        prefixed_path = (
+            self.source_prefix / source_path if self.source_prefix is not None else None
+        )
+        if prefixed_path is not None and (self.repo_root / prefixed_path).is_file():
+            tracked_path = prefixed_path
+        else:
+            tracked_path = source_path
         command = ["git", "blame", "--line-porcelain"]
         if not (self.repo_root / tracked_path).is_file():
             command.append("HEAD")

@@ -79,7 +79,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          cmake make libzstd-dev zlib1g-dev patchelf
+          clang llvm cmake make libzstd-dev zlib1g-dev patchelf
         pip install -r requirements-build.txt
         pip install lit
 
@@ -111,9 +111,52 @@ jobs:
         TVM_PREBUILD_PATH: ${{ github.workspace }}/tvm-prebuild
       run: python setup.py bdist_wheel
 
+    - name: Build C++ coverage wheel
+      if: matrix.arch == 'arm64'
+      run: |
+        BISHENGIR_PATH="${{ github.workspace }}/${{ env.NPUIR_INSTALL_DIR }}"
+        TVM_PATH="${{ github.workspace }}/${{ env.TVM_INSTALL_DIR }}"
+        rm -rf build-coverage dist-coverage build/lib.* build/bdist.*
+        mkdir -p build-coverage
+        cp 3rdparty/tvm/cmake/config.cmake build-coverage/
+        echo "set(USE_NPUIR ON)" >> build-coverage/config.cmake
+        echo "set(BISHENGIR_ROOT_PATH ${BISHENGIR_PATH})" >> build-coverage/config.cmake
+        echo "set(USE_CUDA OFF)" >> build-coverage/config.cmake
+        echo "set(USE_ROCM OFF)" >> build-coverage/config.cmake
+        echo "set(USE_LLVM OFF)" >> build-coverage/config.cmake
+        echo "set(HIDE_PRIVATE_SYMBOLS ON)" >> build-coverage/config.cmake
+        echo "set(USE_KALLOC_ALIGNMENT 64)" >> build-coverage/config.cmake
+        cmake -B build-coverage \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_C_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+          -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+          -DCMAKE_SHARED_LINKER_FLAGS="-fprofile-instr-generate" \
+          -DCMAKE_MODULE_LINKER_FLAGS="-fprofile-instr-generate" \
+          -DTVM_PREBUILD_PATH=${TVM_PATH} \
+          -DTVM_SOURCE_DIR=${{ github.workspace }}/3rdparty/tvm \
+          -DPython3_EXECUTABLE=$(which python3)
+        cmake --build build-coverage --config RelWithDebInfo -j$(nproc)
+        TILELANG_SKIP_BUILD=1 \
+          TILELANG_PREBUILT_LIB_DIR=${{ github.workspace }}/build-coverage \
+          USE_NPUIR=true \
+          BISHENGIR_PATH=${BISHENGIR_PATH} \
+          TVM_PREBUILD_PATH=${TVM_PATH} \
+          python setup.py build_ext --build-temp build-coverage \
+            bdist_wheel --dist-dir dist-coverage
+
     - name: Upload wheel artifact
       uses: actions/upload-artifact@v4
       with:
         name: tilelang-npuir-py${{ env.PYTHON_VERSION }}-${{ matrix.arch }}
         path: dist/*.whl
+        retention-days: 30
+
+    - name: Upload C++ coverage wheel artifact
+      if: matrix.arch == 'arm64'
+      uses: actions/upload-artifact@v4
+      with:
+        name: tilelang-npuir-cpp-coverage-py${{ env.PYTHON_VERSION }}-arm64
+        path: dist-coverage/*.whl
         retention-days: 30

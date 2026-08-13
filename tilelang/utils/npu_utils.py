@@ -59,7 +59,7 @@ class NPUUtils(object):
             if not (os.path.exists(fname_path) and os.path.getsize(fname_path) > 0):
                 # compile npu_utils.so
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    dst_path = os.path.join(tmpdir, "npu_utils.cxx")
+                    dst_path = os.path.join(tmpdir, "npu_utils.cpp")
                     safe_copy(npu_utils_cpp, dst_path)
                     so = build_npu_ext(
                         "npu_utils", None, dst_path, kernel_launcher="torch"
@@ -67,6 +67,12 @@ class NPUUtils(object):
                     safe_copy(so, fname_path)
         else:
             raise FileNotFoundError(f"Could not find npu_utils.cpp at {npu_utils_cpp}.")
+        coverage_object_dir = os.environ.get("TILELANG_CPP_COVERAGE_OBJECT_DIR")
+        if coverage_object_dir:
+            safe_copy(
+                fname_path,
+                os.path.join(coverage_object_dir, "npu_utils.so"),
+            )
         import importlib.util
 
         spec = importlib.util.spec_from_file_location("npu_utils", str(fname_path))
@@ -478,6 +484,19 @@ def build_npu_ext(
     else:
         cxx = get_cxx()
         cc_cmd = [cxx, src_path]
+    if os.environ.get("TILELANG_CPP_COVERAGE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        cc_cmd += ["-fprofile-instr-generate", "-fcoverage-mapping"]
+        coverage_root = os.environ.get("TILELANG_CPP_COVERAGE_REPO_ROOT")
+        if coverage_root and os.path.basename(src_path) == "npu_utils.cpp":
+            cc_cmd += [
+                f"-fcoverage-prefix-map={os.path.dirname(src_path)}="
+                f"{os.path.join(coverage_root, 'tilelang', 'utils')}"
+            ]
     # disable all warnings
     cc_cmd += ["-w"]
     # find python library

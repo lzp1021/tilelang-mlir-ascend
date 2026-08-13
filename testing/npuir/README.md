@@ -150,12 +150,15 @@ python -m pip install -r requirements-test.txt
 python scripts/run_python_coverage.py
 ```
 
-The shared runner first executes every Python operator selected by
+CI installs a dedicated Clang-instrumented ARM64 coverage wheel. The shared
+runner first executes every Python operator selected by
 `examples/run_all.py`, then every `testing/autotune/**/*.py` script, and finally
 every `testing/npuir/*_ops` pytest case. Coverage from the example and autotune
-subprocesses and pytest workers is combined into one report. Autotune scripts
-run sequentially with logical NPU device 0, including scripts under `AscendC/`
-and `anneal/`.
+subprocesses and pytest workers is combined into one report. The same execution
+also writes LLVM profiles for C++ code under `src/`, `tilelangir/`, and the
+runtime-built `tilelang/utils/npu_utils.cpp`. Autotune
+scripts run sequentially with logical NPU device 0, including scripts under
+`AscendC/` and `anneal/`.
 
 The runner accepts the same pytest and NPUIR selection arguments as the direct
 pytest command:
@@ -167,20 +170,29 @@ python scripts/run_python_coverage.py --op=copy --mode=Developer --npu-device=0 
 The command writes these reports:
 
 - pytest HTML: `testing/npuir/output/report.html`
+- integrated recent Python + C++ HTML: `coverage/index.html`
+- integrated recent Cobertura XML: `coverage/coverage.xml`
+- integrated recent summary: `coverage/summary.txt`
 - coverage HTML: `coverage/python-html/index.html`
 - Cobertura coverage XML: `coverage/python.xml`
 - recent-code coverage HTML: `coverage/python-recent.html`
 - recent-code Cobertura XML: `coverage/python-recent.xml`
 - recent-code summary: `coverage/python-recent-summary.txt`
+- recent-code C++ XML: `coverage/cpp-recent.xml`
+- raw C++ LCOV: `coverage/cpp.info`
 - JUnit XML: `coverage/junit.xml`
 
-Coverage measures host Python code under `tilelang/` reached by examples,
-autotune scripts, and NPUIR tests. It does not measure C++ or MLIR
-implementation lines, nor instructions executed by generated NPU kernels.
-The full report is retained for auditing. The recent-code reports use
-`git blame` and include only executable lines committed on or after the date
-eight calendar months before the run date. The CI checkout therefore keeps the
-complete Git history.
+The Python detail report measures host code under `tilelang/`. The integrated
+report adds repository C++ and TileLangIR pass implementation lines reached by
+the same examples, autotune scripts, and NPUIR tests. It does not measure
+instructions executed by generated NPU kernels.
+The full Python report and raw C++ LCOV are retained for auditing. The final
+integrated report uses `git blame` for both languages and includes only
+executable lines committed on or after the date eight calendar months before
+the run date. It measures repository C++ code in `src/`, `tilelangir/`, and
+`tilelang/utils/npu_utils.cpp`, not TVM, AscendNPU-IR, external LLVM/MLIR,
+CANN, or generated kernels. The CI checkout therefore keeps the complete Git
+history.
 
 ## How Filtering Works
 

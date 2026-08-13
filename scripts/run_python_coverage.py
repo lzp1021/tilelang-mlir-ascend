@@ -36,7 +36,27 @@ def build_pytest_command(repo_root: Path, pytest_args: Sequence[str]) -> list[st
 
 
 def prepare_output_directories(repo_root: Path) -> None:
-    (repo_root / "coverage").mkdir(exist_ok=True)
+    coverage_dir = repo_root / "coverage"
+    coverage_dir.mkdir(exist_ok=True)
+    cpp_profraw_dir = coverage_dir / "cpp-profraw"
+    cpp_profraw_dir.mkdir(exist_ok=True)
+    for profile in cpp_profraw_dir.glob("*.profraw"):
+        profile.unlink()
+    cpp_object_dir = coverage_dir / "cpp-objects"
+    cpp_object_dir.mkdir(exist_ok=True)
+    for object_path in cpp_object_dir.glob("*.so"):
+        object_path.unlink()
+    for filename in (
+        "cpp.profdata",
+        "cpp.info",
+        "cpp-recent.xml",
+        "coverage.xml",
+        "index.html",
+        "summary.txt",
+    ):
+        output = coverage_dir / filename
+        if output.is_file():
+            output.unlink()
     (repo_root / "testing" / "npuir" / "output").mkdir(parents=True, exist_ok=True)
 
 
@@ -57,6 +77,8 @@ def run_coverage_pipeline(repo_root: Path, pytest_args: Sequence[str]) -> int:
         [sys.executable, "-m", "coverage", "combine"],
         build_pytest_command(repo_root, pytest_args),
         [sys.executable, "scripts/filter_recent_coverage.py", "--months", "8"],
+        [sys.executable, "scripts/generate_cpp_coverage.py", "--months", "8"],
+        [sys.executable, "scripts/combine_coverage_reports.py", "--months", "8"],
     ]
     return_codes = [run_command(command, repo_root) for command in commands]
     return next((code for code in return_codes if code != 0), 0)

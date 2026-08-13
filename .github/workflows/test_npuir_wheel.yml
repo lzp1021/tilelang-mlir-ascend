@@ -14,7 +14,7 @@ on:
       wheel-artifact:
         description: "Name of the wheel artifact to download"
         type: string
-        default: "tilelang-npuir-py3.11-arm64"
+        default: "tilelang-npuir-cpp-coverage-py3.11-arm64"
 
 jobs:
   test:
@@ -41,7 +41,7 @@ jobs:
         # than eight months, so it needs history beyond the checkout commit.
         fetch-depth: 0
 
-    - name: Download arm64 wheel
+    - name: Download ARM64 C++ coverage wheel
       uses: actions/download-artifact@v4
       with:
         name: ${{ inputs.wheel-artifact }}
@@ -59,9 +59,9 @@ jobs:
         uv pip install dist/*.whl
         uv pip install pytest pytest-xdist pytest-html pytest-cov numpy
 
-    - name: Install clang
+    - name: Install LLVM coverage tools
       run: |
-        apt-get update && apt-get install -y clang
+        apt-get update && apt-get install -y clang llvm
 
     - name: Prepare npuir test workspace
       run: |
@@ -70,9 +70,13 @@ jobs:
           mv tilelang _tilelang_src
         fi
 
-    - name: Run examples and npuir tests with Python coverage
+    - name: Run examples and npuir tests with Python and C++ coverage
       env:
         TILELANG_CLEAR_CACHE: "1"
+        TILELANG_CPP_COVERAGE: "1"
+        TILELANG_CPP_COVERAGE_REPO_ROOT: ${{ github.workspace }}
+        TILELANG_CPP_COVERAGE_OBJECT_DIR: ${{ github.workspace }}/coverage/cpp-objects
+        LLVM_PROFILE_FILE: ${{ github.workspace }}/coverage/cpp-profraw/%m-%p.profraw
       run: python scripts/run_python_coverage.py -v -n 2
 
     - name: Upload test report
