@@ -95,6 +95,12 @@ def collect_examples(base_dir: Path):
     return examples
 
 
+def assign_devices(examples: list[str], num_devices: int, sequential: bool):
+    if sequential:
+        return [(example, 0) for example in examples]
+    return [(example, index % num_devices) for index, example in enumerate(examples)]
+
+
 def run_example(
     rel_path: str,
     base_dir: Path,
@@ -253,7 +259,7 @@ def main():
             print(f"No examples matching filter: {args.filter}")
             sys.exit(1)
 
-    assignments = [(e, i % num_devices) for i, e in enumerate(examples)]
+    assignments = assign_devices(examples, num_devices, args.sequential)
 
     print(
         f"Collected {len(examples)} examples, {num_devices} NPU device(s), {max_workers} worker(s)\n"

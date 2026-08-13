@@ -7,6 +7,22 @@ import pytest
 from examples import run_all
 
 
+def test_assign_devices_uses_only_npu_zero_when_sequential():
+    assert run_all.assign_devices(["a.py", "b.py", "c.py"], 16, True) == [
+        ("a.py", 0),
+        ("b.py", 0),
+        ("c.py", 0),
+    ]
+
+
+def test_assign_devices_round_robins_when_parallel():
+    assert run_all.assign_devices(["a.py", "b.py", "c.py"], 2, False) == [
+        ("a.py", 0),
+        ("b.py", 1),
+        ("c.py", 0),
+    ]
+
+
 def test_run_example_collects_parallel_coverage_in_repository_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
