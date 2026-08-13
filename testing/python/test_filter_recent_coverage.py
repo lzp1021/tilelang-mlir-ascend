@@ -5,6 +5,8 @@ from pathlib import Path
 from scripts.filter_recent_coverage import (
     GitLineDates,
     filter_coverage_tree,
+    normalize_python_filename,
+    normalize_python_filenames,
     subtract_calendar_months,
 )
 
@@ -23,6 +25,44 @@ def test_python_git_paths_keep_tilelang_prefix_when_source_directory_is_moved(
     dates._load("jit/jit_npu.py")
 
     assert commands[0][-1] == Path("tilelang/jit/jit_npu.py").as_posix()
+
+
+def test_python_git_paths_map_installed_package_to_repository(monkeypatch, tmp_path):
+    dates = GitLineDates(tmp_path, date(2025, 12, 13))
+    commands = []
+
+    def record_run(command, **kwargs):
+        commands.append(command)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("scripts.filter_recent_coverage.subprocess.run", record_run)
+    dates._load("/opt/venv/lib/python3.11/site-packages/tilelang/jit/jit_npu.py")
+
+    assert commands[0][-1] == Path("tilelang/jit/jit_npu.py").as_posix()
+
+
+def test_normalize_python_filenames_rewrites_installed_package_paths():
+    root = ET.fromstring(
+        """
+        <coverage><sources><source>/opt/venv/site-packages/tilelang</source></sources>
+          <packages><package><classes>
+            <class filename="/opt/venv/site-packages/tilelang/__init__.py"/>
+            <class filename="tilelang/jit/jit_npu.py"/>
+          </classes></package></packages>
+        </coverage>
+        """
+    )
+
+    normalize_python_filenames(root)
+
+    assert [item.get("filename") for item in root.findall(".//class")] == [
+        "__init__.py",
+        "jit/jit_npu.py",
+    ]
+    assert root.findtext("sources/source") == "."
+    assert normalize_python_filename(r"C:\\venv\\tilelang\\engine\\lower.py") == (
+        "engine/lower.py"
+    )
 
 
 def test_subtract_calendar_months_clamps_to_last_day():

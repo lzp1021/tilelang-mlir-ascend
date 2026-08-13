@@ -47,6 +47,9 @@ def prepare_output_directories(repo_root: Path) -> None:
     for object_path in cpp_object_dir.glob("*.so"):
         object_path.unlink()
     for filename in (
+        "python-recent.xml",
+        "python-recent.html",
+        "python-recent-summary.txt",
         "cpp.profdata",
         "cpp.info",
         "cpp-recent.xml",
@@ -76,11 +79,29 @@ def run_coverage_pipeline(repo_root: Path, pytest_args: Sequence[str]) -> int:
         [sys.executable, "scripts/run_autotune_coverage.py"],
         [sys.executable, "-m", "coverage", "combine"],
         build_pytest_command(repo_root, pytest_args),
-        [sys.executable, "scripts/filter_recent_coverage.py", "--months", "8"],
-        [sys.executable, "scripts/generate_cpp_coverage.py", "--months", "8"],
-        [sys.executable, "scripts/combine_coverage_reports.py", "--months", "8"],
     ]
     return_codes = [run_command(command, repo_root) for command in commands]
+    python_recent_code = run_command(
+        [sys.executable, "scripts/filter_recent_coverage.py", "--months", "8"],
+        repo_root,
+    )
+    cpp_recent_code = run_command(
+        [sys.executable, "scripts/generate_cpp_coverage.py", "--months", "8"],
+        repo_root,
+    )
+    return_codes.extend((python_recent_code, cpp_recent_code))
+    if python_recent_code == 0 and cpp_recent_code == 0:
+        return_codes.append(
+            run_command(
+                [
+                    sys.executable,
+                    "scripts/combine_coverage_reports.py",
+                    "--months",
+                    "8",
+                ],
+                repo_root,
+            )
+        )
     return next((code for code in return_codes if code != 0), 0)
 
 

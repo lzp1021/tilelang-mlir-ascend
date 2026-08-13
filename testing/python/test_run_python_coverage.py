@@ -76,6 +76,8 @@ def test_prepare_output_directories_creates_report_parents(tmp_path: Path):
     stale_object.write_text("old", encoding="utf-8")
     stale_report = tmp_path / "coverage" / "coverage.xml"
     stale_report.write_text("old", encoding="utf-8")
+    stale_python_recent = tmp_path / "coverage" / "python-recent.xml"
+    stale_python_recent.write_text("old", encoding="utf-8")
 
     prepare_output_directories(tmp_path)
 
@@ -84,6 +86,7 @@ def test_prepare_output_directories_creates_report_parents(tmp_path: Path):
     assert not stale_profile.exists()
     assert not stale_object.exists()
     assert not stale_report.exists()
+    assert not stale_python_recent.exists()
     assert (tmp_path / "testing" / "npuir" / "output").is_dir()
 
 
@@ -131,6 +134,25 @@ def test_coverage_pipeline_combines_examples_before_appending_pytest_data(
         [sys.executable, "scripts/generate_cpp_coverage.py", "--months", "8"],
         [sys.executable, "scripts/combine_coverage_reports.py", "--months", "8"],
     ]
+
+
+def test_coverage_pipeline_does_not_combine_stale_recent_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / "testing" / "npuir" / "memory_ops").mkdir(parents=True)
+    commands = []
+
+    def fail_python_filter(command, cwd):
+        commands.append(list(command))
+        if "scripts/filter_recent_coverage.py" in command:
+            return 7
+        return 0
+
+    monkeypatch.setattr(coverage_runner, "run_command", fail_python_filter)
+
+    assert coverage_runner.run_coverage_pipeline(tmp_path, []) == 7
+    assert not any("scripts/combine_coverage_reports.py" in item for item in commands)
+    assert any("scripts/generate_cpp_coverage.py" in item for item in commands)
 
 
 def test_coverage_policy_measures_tilelang_branches_and_shows_missing_lines():

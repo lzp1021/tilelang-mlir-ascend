@@ -78,6 +78,28 @@ def set_rates(element: ET.Element, counts: Counts) -> None:
     element.set("branch-rate", rate(counts.branches_covered, counts.branches_valid))
 
 
+def normalize_python_filename(filename: str) -> str:
+    normalized = re.sub(r"/+", "/", filename.replace("\\", "/")).removeprefix("./")
+    package_marker = "/tilelang/"
+    if package_marker in normalized:
+        return normalized.rsplit(package_marker, 1)[1]
+    for prefix in ("tilelang/", "_tilelang_src/"):
+        if normalized.startswith(prefix):
+            return normalized[len(prefix) :]
+    return normalized
+
+
+def normalize_python_filenames(root: ET.Element) -> None:
+    for class_element in root.findall(".//class"):
+        filename = class_element.get("filename")
+        if filename:
+            class_element.set("filename", normalize_python_filename(filename))
+    sources = root.find("sources")
+    if sources is not None:
+        for source in sources.findall("source"):
+            source.text = "."
+
+
 def filter_coverage_tree(
     root: ET.Element, is_recent: Callable[[str, int], bool]
 ) -> tuple[Counts, list[FileStats]]:
@@ -152,7 +174,11 @@ class GitLineDates:
             ) from exc
 
     def _load(self, filename: str) -> dict[int, date]:
-        source_path = Path(filename)
+        source_path = Path(
+            normalize_python_filename(filename)
+            if self.source_prefix is not None
+            else filename
+        )
         tracked_path = (
             self.source_prefix / source_path
             if self.source_prefix is not None
@@ -291,6 +317,7 @@ def generate_recent_report(
     parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
     tree = ET.parse(input_xml, parser=parser)
     root = tree.getroot()
+    normalize_python_filenames(root)
     original_lines = int(root.get("lines-valid", "0"))
     total, stats = filter_coverage_tree(root, GitLineDates(repo_root, cutoff).is_recent)
     output_xml.parent.mkdir(parents=True, exist_ok=True)
