@@ -91,7 +91,14 @@ def normalize_source_path(raw_path: str, repo_root: Path) -> Optional[str]:
     if Path(normalized).suffix.lower() not in CPP_SUFFIXES:
         return None
     if not (repo_root / normalized).is_file():
-        return None
+        tracked = subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{normalized}"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        )
+        if tracked.returncode != 0:
+            return None
     return normalized
 
 

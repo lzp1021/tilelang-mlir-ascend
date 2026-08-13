@@ -153,13 +153,11 @@ class GitLineDates:
 
     def _load(self, filename: str) -> dict[int, date]:
         source_path = Path(filename)
-        prefixed_path = (
-            self.source_prefix / source_path if self.source_prefix is not None else None
+        tracked_path = (
+            self.source_prefix / source_path
+            if self.source_prefix is not None
+            else source_path
         )
-        if prefixed_path is not None and (self.repo_root / prefixed_path).is_file():
-            tracked_path = prefixed_path
-        else:
-            tracked_path = source_path
         command = ["git", "blame", "--line-porcelain"]
         if not (self.repo_root / tracked_path).is_file():
             command.append("HEAD")
