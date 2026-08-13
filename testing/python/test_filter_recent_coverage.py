@@ -41,6 +41,34 @@ def test_python_git_paths_map_installed_package_to_repository(monkeypatch, tmp_p
     assert commands[0][-1] == Path("tilelang/jit/jit_npu.py").as_posix()
 
 
+def test_python_coverage_lines_map_around_packaging_injections(monkeypatch, tmp_path):
+    repository_source = tmp_path / "tilelang" / "__init__.py"
+    repository_source.parent.mkdir()
+    repository_source.write_text("old\nrecent\ntail\n", encoding="utf-8")
+    installed_source = tmp_path / "site-packages" / "tilelang" / "__init__.py"
+    installed_source.parent.mkdir(parents=True)
+    installed_source.write_text(
+        "generated one\ngenerated two\nold\nrecent\ntail\n", encoding="utf-8"
+    )
+    dates = GitLineDates(tmp_path, date(2025, 12, 13))
+    dates.register_coverage_source(str(installed_source))
+    monkeypatch.setattr(
+        dates,
+        "_load",
+        lambda filename: {
+            1: date(2025, 1, 1),
+            2: date(2026, 1, 1),
+            3: date(2025, 1, 1),
+        },
+    )
+
+    assert not dates.is_recent("__init__.py", 1)
+    assert not dates.is_recent("__init__.py", 2)
+    assert not dates.is_recent("__init__.py", 3)
+    assert dates.is_recent("__init__.py", 4)
+    assert not dates.is_recent("__init__.py", 5)
+
+
 def test_normalize_python_filenames_rewrites_installed_package_paths():
     root = ET.fromstring(
         """

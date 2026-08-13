@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import difflib
 import html
 import re
 import subprocess
@@ -161,8 +162,45 @@ class GitLineDates:
         self.cutoff = cutoff
         self.source_prefix = source_prefix
         self._cache: dict[str, dict[int, date]] = {}
+        self._line_maps: dict[str, dict[int, int]] = {}
+
+    def register_coverage_source(self, filename: str) -> None:
+        if self.source_prefix is None:
+            return
+        normalized = normalize_python_filename(filename)
+        coverage_path = Path(filename)
+        repository_path = self.repo_root / self.source_prefix / normalized
+        if not coverage_path.is_absolute() or not coverage_path.is_file():
+            return
+        coverage_lines = coverage_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        repository_lines = repository_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        if coverage_lines == repository_lines:
+            return
+        matcher = difflib.SequenceMatcher(
+            None, repository_lines, coverage_lines, autojunk=False
+        )
+        self._line_maps[normalized] = {
+            coverage_index + offset + 1: repository_index + offset + 1
+            for repository_index, coverage_index, size in matcher.get_matching_blocks()
+            for offset in range(size)
+        }
 
     def is_recent(self, filename: str, line_number: int) -> bool:
+        normalized = (
+            normalize_python_filename(filename)
+            if self.source_prefix is not None
+            else filename
+        )
+        line_map = self._line_maps.get(normalized)
+        if line_map is not None:
+            repository_line = line_map.get(line_number)
+            if repository_line is None:
+                return False
+            line_number = repository_line
         if filename not in self._cache:
             self._cache[filename] = self._load(filename)
         dates = self._cache[filename]
@@ -317,9 +355,14 @@ def generate_recent_report(
     parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
     tree = ET.parse(input_xml, parser=parser)
     root = tree.getroot()
+    git_dates = GitLineDates(repo_root, cutoff)
+    for class_element in root.findall(".//class"):
+        filename = class_element.get("filename")
+        if filename:
+            git_dates.register_coverage_source(filename)
     normalize_python_filenames(root)
     original_lines = int(root.get("lines-valid", "0"))
-    total, stats = filter_coverage_tree(root, GitLineDates(repo_root, cutoff).is_recent)
+    total, stats = filter_coverage_tree(root, git_dates.is_recent)
     output_xml.parent.mkdir(parents=True, exist_ok=True)
     ET.indent(tree, space="  ")
     tree.write(output_xml, encoding="utf-8", xml_declaration=True)
